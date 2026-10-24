@@ -1,0 +1,23 @@
+name: ci
+on: [push, pull_request]
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # needs the `starter` tag
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test --all-targets
+      - name: starter helpers unchanged
+        run: git diff --exit-code starter -- src/util sbe_schemas src/side.rs
+      - name: no f64 on the data path
+        run: "! grep -rnw f64 src --exclude-dir=util"
+      - name: stdout stays empty
+        run: test "$(cargo run -q | wc -c)" -eq 0
