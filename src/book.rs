@@ -81,6 +81,19 @@ impl OrderBook {
         Ok(new)
     }
 
+    /// Set an absolute quantity (0 removes the level). Used to mirror emitted output.
+    pub fn set_level(&mut self, side: Side, price: i64, qty: i64) {
+        let levels = match side {
+            Side::Buy => &mut self.bids,
+            Side::Sell => &mut self.asks,
+        };
+        if qty == 0 {
+            levels.remove(&price);
+        } else {
+            levels.insert(price, qty);
+        }
+    }
+
     /// Bids descending by price, asks ascending: the order used in `Snapshot`.
     pub fn levels(&self) -> (Levels, Levels) {
         (

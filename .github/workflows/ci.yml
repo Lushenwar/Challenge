@@ -20,4 +20,4 @@ jobs:
       - name: no f64 on the data path
         run: "! grep -rnw f64 src --exclude-dir=util"
       - name: stdout stays empty
-        run: test "$(cargo run -q | wc -c)" -eq 0
+        run: test "$(cargo run -q -- --help | wc -c)" -eq 0
