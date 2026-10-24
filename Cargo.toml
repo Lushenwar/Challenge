@@ -1,0 +1,18 @@
+[package]
+name = "engineering-challenge"
+version = "0.1.0"
+edition = "2024"
+build = "src/util/build.rs"
+
+[dependencies]
+anyhow = "1"
+chrono = "0.4"
+crossbeam = "0.8.4"
+serde = { version = "1", features = ["derive"] }
+tempfile = "3"
+
+[build-dependencies]
+ergo-sbe = "=0.1.16"
+indexmap = { version = "2", features = ["serde"] }
+serde = { version = "1", features = ["derive"] }
+serde_yaml_ng = "0.9"

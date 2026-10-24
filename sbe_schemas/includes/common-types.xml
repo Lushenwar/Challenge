@@ -1,0 +1,60 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Shared SBE wire encodings. These definitions are included by every schema so
+  message files contain only schema-specific types and message declarations.
+
+  Changing an existing encoding changes every schema that uses it. Add a new
+  named encoding instead when a different wire representation is required.
+-->
+<types>
+  <!-- Standard 8-byte SBE message header. These names are required by the tooling. -->
+  <composite name="messageHeader" description="Message identifiers and length of message root">
+    <type name="blockLength" primitiveType="uint16"/>
+    <type name="templateId"  primitiveType="uint16"/>
+    <type name="schemaId"    primitiveType="uint16"/>
+    <type name="version"     primitiveType="uint16"/>
+  </composite>
+
+  <!-- Repeating-group dimensions written before each group instance. -->
+  <composite name="groupSizeEncoding" description="Repeating group dimensions">
+    <type name="blockLength" primitiveType="uint16"/>
+    <type name="numInGroup"  primitiveType="uint16"/>
+  </composite>
+
+  <!-- Variable-length UTF-8 string with a uint32 byte-length prefix. -->
+  <composite name="varStringEncoding" description="Variable-length UTF-8 string">
+    <type name="length"  primitiveType="uint32" maxValue="1073741824"/>
+    <type name="varData" primitiveType="uint8" length="0" characterEncoding="UTF-8"/>
+  </composite>
+
+  <!-- UTC microseconds since the UNIX epoch; the constant unit occupies no wire bytes. -->
+  <composite name="UTCTimestampMicrosEncoding" semanticType="UTCTimestamp"
+             description="UTC microseconds since the UNIX epoch">
+    <type name="time" primitiveType="uint64"/>
+    <type name="unit" primitiveType="uint8" presence="constant">6</type>
+  </composite>
+
+  <!-- Same 8 bytes, but u64::MAX is reserved to mean "unknown". SBE has no
+       presence="optional" for a composite as a whole, so the nullability rides
+       on `time` and you test that member — the pattern real-logic points at in
+       issue #509. Picked by `type: timestamp, optional: true` in the yaml. -->
+  <composite name="UTCTimestampMicrosNullableEncoding" semanticType="UTCTimestamp"
+             description="UTC microseconds since the UNIX epoch, or null">
+    <type name="time" primitiveType="uint64" presence="optional"/>
+    <type name="unit" primitiveType="uint8" presence="constant">6</type>
+  </composite>
+
+  <type name="bytes32" primitiveType="uint8" length="32"/>
+  <type name="address" primitiveType="uint8" length="20"/>
+
+  <!-- The shared Side domain enum owns and validates the Buy/Sell values. -->
+  <composite name="SideEncoding" description="Orderbook side: 0 = Buy (bid), 1 = Sell (ask)">
+    <type name="value" primitiveType="uint8"/>
+  </composite>
+
+  <!-- FIX-standard boolean: one byte on the wire. -->
+  <enum name="BooleanType" encodingType="uint8">
+    <validValue name="False">0</validValue>
+    <validValue name="True">1</validValue>
+  </enum>
+</types>

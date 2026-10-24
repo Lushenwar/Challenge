@@ -1,0 +1,56 @@
+id: 1
+version: 2
+description: Voluntas engineering challenge orderbook update schema.
+
+messages:
+  Snapshot:
+    id: 1
+    description: A full snapshot of the orderbook
+    fields:
+      received_at: { id: 1, type: timestamp }
+      exchange_timestamp: { id: 2, type: timestamp }
+      bids:
+        id: 4
+        description: Bid price levels
+        fields:
+          price_level:
+            id: 5
+            type: int64
+            description: The price level, in fixed point; 1_000_000 = 1 USDC
+          quantity:
+            id: 6
+            type: int64
+            description: The absolute available quantity, in fixed point; 1_000_000 = 1 share/contract
+      asks:
+        id: 7
+        description: Ask price levels
+        fields:
+          price_level:
+            id: 8
+            type: int64
+            description: The price level, in fixed point; 1_000_000 = 1 USDC
+          quantity:
+            id: 9
+            type: int64
+            description: The absolute available quantity, in fixed point; 1_000_000 = 1 share/contract
+      symbol: { id: 3, type: string }
+
+  PriceLevelUpdate:
+    id: 2
+    description: An update to a single price level, on a single orderbook
+    fields:
+      backtest_timestamp: { id: 1, type: timestamp }
+      exchange_timestamp: { id: 2, type: timestamp }
+      price_level:
+        id: 4
+        type: int64
+        description: The price level being updated, in fixed point; 1_000_000 = 1 USDC
+      quantity:
+        id: 5
+        type: int64
+        description: The absolute available quantity, in fixed point; 1_000_000 = 1 share/contract
+      side:
+        id: 6
+        type: SideEncoding
+        description: The side being updated; Buy = bid, Sell = ask
+      symbol: { id: 3, type: string }
