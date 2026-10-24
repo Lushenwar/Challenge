@@ -1,4 +1,5 @@
 pub mod auth;
+pub mod codec;
 pub mod discovery;
 
 pub const REST_PROD: &str = "https://api.elections.kalshi.com/trade-api/v2";
