@@ -1,5 +1,5 @@
 {
- "recording": "/home/ryann/rec/lat_e2.jsonl",
+ "recording": "lat_e2.jsonl",
  "matched_updates": 5576,
  "connections": {
   "c0-cloudfront-lifecycle": {

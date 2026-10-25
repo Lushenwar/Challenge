@@ -1,5 +1,5 @@
 {
- "recording": "/home/ryann/rec/lat_e3.jsonl",
+ "recording": "lat_e3.jsonl",
  "matched_updates": 4310,
  "connections": {
   "c0-65.8.70.91": {

@@ -1,5 +1,5 @@
 {
- "recording": "/home/ryann/rec/lat_e1.jsonl",
+ "recording": "lat_e1.jsonl",
  "matched_updates": 4611,
  "connections": {
   "c0-nodelay-lifecycle": {

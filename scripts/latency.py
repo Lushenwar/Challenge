@@ -10,7 +10,7 @@ includes the local clock's offset from the exchange's.
 
 Usage: latency.py recording.jsonl [--labels a,b,c] [--windows 4] > result.json
 """
-import argparse, collections, json, statistics, sys
+import argparse, collections, json, os, statistics, sys
 
 
 def pct(xs, p):
@@ -65,7 +65,7 @@ def main():
 
     name = lambda c: labels[c] if c < len(labels) else str(c)
     out = {
-        "recording": a.recording,
+        "recording": os.path.basename(a.recording),
         "matched_updates": n,
         "connections": {
             name(c): {
