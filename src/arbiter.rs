@@ -684,6 +684,111 @@ mod tests {
         s.bids.iter().map(|l| (l.price_level, l.quantity)).collect()
     }
 
+    #[derive(Debug, Clone)]
+    enum Op {
+        /// The exchange changes a level; every valid source gets it, in `order`.
+        Change {
+            price: i64,
+            qty: i64,
+            order: [usize; 3],
+        },
+        Disconnect(usize),
+        Invalidate(usize),
+        /// The source resubscribes and receives a snapshot of the current true book.
+        Resubscribe(usize),
+        Periodic,
+    }
+
+    fn op() -> impl proptest::strategy::Strategy<Value = Op> {
+        use proptest::prelude::*;
+        let src = 0usize..3;
+        prop_oneof![
+            6 => (0i64..3, 0i64..4, Just([0usize, 1, 2]).prop_shuffle())
+                .prop_map(|(p, qty, order)| Op::Change { price: 100_000 * (p + 1), qty, order }),
+            1 => src.clone().prop_map(Op::Disconnect),
+            1 => src.clone().prop_map(Op::Invalidate),
+            2 => src.prop_map(Op::Resubscribe),
+            1 => Just(Op::Periodic),
+        ]
+    }
+
+    proptest::proptest! {
+        /// Random interleavings across three sources. Whenever some source is valid,
+        /// the book the output describes equals the true book; nothing is written while
+        /// no source is valid; the first message is a snapshot; output time never goes
+        /// backwards.
+        #[test]
+        fn output_tracks_the_true_book_through_any_interleaving(
+            ops in proptest::collection::vec(op(), 1..80),
+        ) {
+            let mut a = Arbiter::default();
+            let mut truth: BTreeMap<i64, i64> = BTreeMap::new();
+            let mut valid = [false; 3];
+            let mut out_book: Option<BTreeMap<i64, i64>> = None;
+            let mut last_out = i64::MIN;
+            let mut t = 0i64;
+            for op in ops {
+                t += 10;
+                let mut out = Vec::new();
+                match op {
+                    Op::Change { price, qty, order } => {
+                        if qty == 0 { truth.remove(&price); } else { truth.insert(price, qty); }
+                        for (k, c) in order.into_iter().enumerate() {
+                            if valid[c] {
+                                let ev = ConnEvent::Update {
+                                    conn: c, market: "T".into(), side: Side::Buy, price, qty,
+                                    recv_us: t + k as i64, exch_us: t,
+                                };
+                                a.on_event(ev, &mut out);
+                            }
+                        }
+                    }
+                    Op::Disconnect(c) => {
+                        valid[c] = false;
+                        a.on_event(ConnEvent::Disconnected { conn: c }, &mut out);
+                    }
+                    Op::Invalidate(c) => {
+                        valid[c] = false;
+                        a.on_event(ConnEvent::Invalidated { conn: c, market: "T".into() }, &mut out);
+                    }
+                    Op::Resubscribe(c) => {
+                        valid[c] = true;
+                        let bids: Vec<(i64, i64)> = truth.iter().map(|(&p, &q)| (p, q)).collect();
+                        let ev = ConnEvent::Snapshot {
+                            conn: c, market: "T".into(), book: OrderBook::from_levels(&bids, &[]).unwrap(),
+                            recv_us: t, exch_us: t, cause: SnapCause::Subscribed,
+                        };
+                        a.on_event(ev, &mut out);
+                    }
+                    Op::Periodic => a.snapshot_all(t, SnapCause::Periodic, &mut out),
+                }
+                if !valid.iter().any(|&v| v) {
+                    proptest::prop_assert!(out.is_empty(), "wrote {:?} with no valid source", out);
+                }
+                for m in &out {
+                    let at = match m {
+                        OutMsg::Snapshot(s) => {
+                            out_book = Some(s.bids.iter().map(|l| (l.price_level, l.quantity)).collect());
+                            s.received_at.timestamp_micros()
+                        }
+                        OutMsg::Update(u) => {
+                            let book = out_book.as_mut();
+                            proptest::prop_assert!(book.is_some(), "update before any snapshot");
+                            let book = book.unwrap();
+                            if u.quantity == 0 { book.remove(&u.price_level); } else { book.insert(u.price_level, u.quantity); }
+                            u.backtest_timestamp.timestamp_micros()
+                        }
+                    };
+                    proptest::prop_assert!(at >= last_out, "output time went back: {} < {}", at, last_out);
+                    last_out = at;
+                }
+                if valid.iter().any(|&v| v) {
+                    proptest::prop_assert_eq!(out_book.as_ref(), Some(&truth));
+                }
+            }
+        }
+    }
+
     #[test]
     fn forwards_only_the_active_source() {
         let mut a = Arbiter::default();

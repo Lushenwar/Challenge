@@ -163,6 +163,46 @@ mod tests {
         );
     }
 
+    proptest::proptest! {
+        /// Random batches of adds and removes: every market is on exactly `replicas`
+        /// distinct sockets, no socket is over capacity, the socket sets agree with the
+        /// assignments, and a market that stays never moves.
+        #[test]
+        fn invariants_hold_under_random_adds_and_removes(
+            cap in 1usize..20,
+            replicas in 1usize..4,
+            ops in proptest::collection::vec((proptest::bool::ANY, 0usize..60, 1usize..15), 1..40),
+        ) {
+            let mut p = Planner::new(cap, replicas);
+            for (add, start, n) in ops {
+                let batch = names(start..start + n);
+                let before = p.assigned.clone();
+                if add {
+                    p.add(batch.clone());
+                } else {
+                    p.remove(&batch);
+                }
+                for (m, cs) in &p.assigned {
+                    let distinct: HashSet<_> = cs.iter().collect();
+                    proptest::prop_assert_eq!(distinct.len(), replicas, "{} on {:?}", m, cs);
+                    for &c in cs {
+                        proptest::prop_assert!(p.sockets[c].contains(m));
+                    }
+                    if let Some(old) = before.get(m) {
+                        proptest::prop_assert_eq!(old, cs, "{} moved", m);
+                    }
+                }
+                for s in &p.sockets {
+                    proptest::prop_assert!(s.len() <= cap);
+                    proptest::prop_assert!(s.iter().all(|m| p.assigned.contains_key(m)));
+                }
+                for m in &batch {
+                    proptest::prop_assert_eq!(p.contains(m), add);
+                }
+            }
+        }
+    }
+
     #[test]
     fn sticky_idempotent_and_reuses_freed_room() {
         let mut p = Planner::new(2, 2);

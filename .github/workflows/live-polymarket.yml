@@ -1,0 +1,38 @@
+name: live-polymarket
+# Manual: a short live capture of Polymarket's public feed (no credentials needed),
+# checked with `verify`. Proves the binary works against a real venue from a clean runner.
+on:
+  workflow_dispatch:
+    inputs:
+      seconds:
+        description: capture length
+        default: "300"
+
+jobs:
+  capture:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --bins
+      - name: capture
+        run: |
+          ./target/release/engineering-challenge --exchange polymarket --max-markets 500 \
+            --output cap.sbe --report report.json 2> cap.log &
+          pid=$!
+          sleep "${{ inputs.seconds }}"
+          kill -INT $pid
+          wait $pid
+      - name: verify
+        run: |
+          ./target/release/verify cap.sbe --events cap.log > verify.json
+          python3 -c "import json; d=json.load(open('verify.json')); d.pop('per_symbol'); print(json.dumps(d, indent=1))" | tee verify-summary.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: live-polymarket
+          path: |
+            verify-summary.json
+            report.json
