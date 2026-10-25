@@ -26,7 +26,10 @@ const PAGE: usize = 100;
 const MAX_OFFSET: usize = 1_900;
 const BATCH: usize = 500;
 
-pub struct Polymarket;
+pub struct Polymarket {
+    /// Gamma REST base URL (normally [`GAMMA`]).
+    pub gamma: String,
+}
 
 impl Exchange for Polymarket {
     fn name(&self) -> &'static str {
@@ -48,7 +51,7 @@ impl Exchange for Polymarket {
         &'a self,
         client: &'a reqwest::Client,
     ) -> BoxFuture<'a, anyhow::Result<Vec<MarketInfo>>> {
-        Box::pin(discover(client))
+        Box::pin(discover(client, &self.gamma))
     }
 
     fn session(&self, _lifecycle: bool) -> Box<dyn Session> {
@@ -58,12 +61,12 @@ impl Exchange for Polymarket {
     }
 }
 
-async fn discover(client: &reqwest::Client) -> anyhow::Result<Vec<MarketInfo>> {
+async fn discover(client: &reqwest::Client, gamma: &str) -> anyhow::Result<Vec<MarketInfo>> {
     let mut out = Vec::new();
     let mut offset = 0;
     while offset <= MAX_OFFSET {
         let url = format!(
-            "{GAMMA}/markets?active=true&closed=false&order=volume24hr&ascending=false&limit={PAGE}&offset={offset}"
+            "{gamma}/markets?active=true&closed=false&order=volume24hr&ascending=false&limit={PAGE}&offset={offset}"
         );
         let resp = client.get(&url).send().await?;
         if !resp.status().is_success() {

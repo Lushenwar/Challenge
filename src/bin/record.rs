@@ -26,7 +26,7 @@ use tokio_tungstenite::tungstenite::{Message, handshake::client::Request};
 #[derive(Parser)]
 struct Args {
     #[command(flatten)]
-    venue: exchange::Args,
+    venue: exchange::VenueArgs,
     /// Record the N most active markets (by 24h volume).
     #[arg(long, default_value_t = 50)]
     markets: usize,

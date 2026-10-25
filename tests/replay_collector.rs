@@ -21,7 +21,7 @@ fn kalshi_session() -> Box<dyn engineering_challenge::exchange::Session> {
         .to_pkcs8_pem(Default::default())
         .unwrap();
     let signer = kalshi::auth::Signer::new("test".into(), &pem).unwrap();
-    kalshi::Kalshi::new(kalshi::Env::Prod, signer).session(false)
+    kalshi::Kalshi::new(kalshi::Env::Prod, signer, String::new()).session(false)
 }
 
 const FIXTURE: &str = concat!(

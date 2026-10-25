@@ -33,7 +33,7 @@ struct Args {
     #[arg(long, default_value = "127.0.0.1:9000")]
     listen: String,
     #[command(flatten)]
-    venue: exchange::Args,
+    venue: exchange::VenueArgs,
     /// Mean seconds between faults on each connection.
     #[arg(long, default_value_t = 120)]
     fault_every: u64,

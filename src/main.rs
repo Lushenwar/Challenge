@@ -13,7 +13,7 @@ use tokio::sync::{mpsc, watch};
 #[command(about = "Prediction-market order books → SBE on stdout")]
 struct Args {
     #[command(flatten)]
-    venue: exchange::Args,
+    venue: exchange::VenueArgs,
     /// Only collect the N most active markets (by 24h volume). Default: all live markets.
     #[arg(long)]
     max_markets: Option<usize>,
@@ -60,11 +60,19 @@ fn main() -> anyhow::Result<()> {
 
 async fn collect(args: Args) -> anyhow::Result<()> {
     let started_us = now_us();
+    // Handlers first: a signal during startup (initial discovery can take ~40 s) must not
+    // kill the process by default or, when started as a background job with SIGINT
+    // ignored, be lost.
+    let mut signals = Signals::new()?;
     let exchange = args.venue.build()?;
-    let markets = exchange
-        .discover(&reqwest::Client::new())
-        .await
-        .context("initial discovery")?;
+    let client = reqwest::Client::new();
+    let markets = tokio::select! {
+        m = exchange.discover(&client) => m.context("initial discovery")?,
+        _ = signals.next() => {
+            tracing::info!("signal during startup; nothing collected yet, exiting");
+            return Ok(());
+        }
+    };
     tracing::info!(
         venue = exchange.name(),
         markets = markets.len(),
@@ -87,10 +95,10 @@ async fn collect(args: Args) -> anyhow::Result<()> {
     let control = tokio::spawn(control::run(cfg, markets, ev_tx, ctl_rx, stop_rx));
     let arbiter = tokio::spawn(arbiter::run(ev_rx, out_tx, ctl_tx));
 
-    shutdown_signal().await;
+    signals.next().await;
     tracing::info!("shutting down");
-    tokio::spawn(async {
-        shutdown_signal().await;
+    tokio::spawn(async move {
+        signals.next().await;
         tracing::warn!("second signal; exiting now");
         std::process::exit(130);
     });
@@ -125,11 +133,25 @@ fn parse_drop(s: &str) -> Result<(usize, Duration), String> {
     ))
 }
 
-async fn shutdown_signal() {
-    let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-        .expect("SIGTERM handler");
-    tokio::select! {
-        _ = tokio::signal::ctrl_c() => {}
-        _ = term.recv() => {}
+/// SIGINT and SIGTERM, registered once at startup.
+struct Signals {
+    int: tokio::signal::unix::Signal,
+    term: tokio::signal::unix::Signal,
+}
+
+impl Signals {
+    fn new() -> anyhow::Result<Self> {
+        use tokio::signal::unix::{SignalKind, signal};
+        Ok(Self {
+            int: signal(SignalKind::interrupt())?,
+            term: signal(SignalKind::terminate())?,
+        })
+    }
+
+    async fn next(&mut self) {
+        tokio::select! {
+            _ = self.int.recv() => {}
+            _ = self.term.recv() => {}
+        }
     }
 }

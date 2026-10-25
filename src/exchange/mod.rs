@@ -138,7 +138,7 @@ pub enum Venue {
 
 /// Venue choice and credentials, shared by every binary.
 #[derive(Debug, Clone, clap::Args)]
-pub struct Args {
+pub struct VenueArgs {
     #[arg(long, value_enum, default_value = "kalshi")]
     pub exchange: Venue,
     #[arg(long, value_enum, default_value = "prod")]
@@ -147,9 +147,12 @@ pub struct Args {
     pub key_id: Option<String>,
     #[arg(long, env = "KALSHI_PRIVATE_KEY_PATH")]
     pub key_path: Option<PathBuf>,
+    /// REST base URL override for discovery (tests, fake exchanges).
+    #[arg(long)]
+    pub rest_url: Option<String>,
 }
 
-impl Args {
+impl VenueArgs {
     pub fn build(&self) -> anyhow::Result<Arc<dyn Exchange>> {
         Ok(match self.exchange {
             Venue::Kalshi => {
@@ -159,9 +162,18 @@ impl Args {
                     );
                 };
                 let signer = kalshi::auth::Signer::from_file(id.clone(), path)?;
-                Arc::new(kalshi::Kalshi::new(self.env, signer))
+                let rest = self
+                    .rest_url
+                    .clone()
+                    .unwrap_or_else(|| self.env.rest().to_owned());
+                Arc::new(kalshi::Kalshi::new(self.env, signer, rest))
             }
-            Venue::Polymarket => Arc::new(polymarket::Polymarket),
+            Venue::Polymarket => Arc::new(polymarket::Polymarket {
+                gamma: self
+                    .rest_url
+                    .clone()
+                    .unwrap_or_else(|| polymarket::GAMMA.to_owned()),
+            }),
         })
     }
 }

@@ -14,7 +14,7 @@ fn state() -> ConnState {
         .to_pkcs8_pem(Default::default())
         .unwrap();
     let signer = kalshi::auth::Signer::new("test".into(), &pem).unwrap();
-    let k = kalshi::Kalshi::new(kalshi::Env::Prod, signer);
+    let k = kalshi::Kalshi::new(kalshi::Env::Prod, signer, String::new());
     let mut s = ConnState::new(0, &["T".into()], k.session(false));
     s.subscribe_cmds();
     s

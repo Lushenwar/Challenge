@@ -49,11 +49,13 @@ impl Env {
 pub struct Kalshi {
     env: Env,
     signer: auth::Signer,
+    rest: String,
 }
 
 impl Kalshi {
-    pub fn new(env: Env, signer: auth::Signer) -> Self {
-        Self { env, signer }
+    /// `rest`: the REST base URL used for discovery (normally `env.rest()`).
+    pub fn new(env: Env, signer: auth::Signer, rest: String) -> Self {
+        Self { env, signer, rest }
     }
 }
 
@@ -75,7 +77,7 @@ impl Exchange for Kalshi {
         &'a self,
         client: &'a reqwest::Client,
     ) -> BoxFuture<'a, anyhow::Result<Vec<MarketInfo>>> {
-        Box::pin(discovery::discover(client, self.env.rest()))
+        Box::pin(discovery::discover(client, &self.rest))
     }
 
     fn session(&self, lifecycle: bool) -> Box<dyn Session> {
