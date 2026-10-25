@@ -35,6 +35,9 @@ struct Args {
     /// The collector's stderr log; explains non-periodic snapshots.
     #[arg(long)]
     events: Option<PathBuf>,
+    /// Zero-pad a capture whose last chunk was cut off (collector killed) before reading.
+    #[arg(long)]
+    repair: bool,
 }
 
 type Book = BTreeMap<(u8, i64), i64>;
@@ -104,6 +107,13 @@ fn main() -> anyhow::Result<()> {
         Some(p) => (read_events(p)?, read_gaps(p)?),
         None => (HashMap::new(), HashMap::new()),
     };
+    if args.repair {
+        let added = engineering_challenge::writer::pad_capture(
+            &args.capture,
+            engineering_challenge::writer::CHUNK,
+        )?;
+        eprintln!("repair: padded {added} bytes");
+    }
     let mut r = AlignedSbeReader::<OrderbookSchema>::open(&args.capture)?;
     let mut symbols: HashMap<String, Symbol> = HashMap::new();
     let mut messages = 0u64;

@@ -81,8 +81,12 @@ function for snapshots and deltas).
 
 **Chunking.** The starter reader only reads 64 MiB chunks (its smaller-chunk constructor
 is private), so the writer uses 64 MiB chunks: anything else is unreadable by the official
-reader. A chunk is written when it fills and at shutdown. The cost: output reaches the file
-in 64 MiB blocks; a time-based flush would pad each block with up to 64 MiB of zeros.
+reader. The writer (`src/writer.rs`) produces byte-for-byte what the starter
+`AlignedSbeWriter` would (a property test compares the two), but every second it also
+writes the bytes added to the current chunk, unpadded; a chunk is padded only when it is
+full and at shutdown. So data is on disk within ~1 s and a crash loses at most a second.
+The starter reader loads complete chunks only: a capture cut off by `kill -9` is made
+readable with `verify capture.sbe --repair`, which zero-pads the last chunk.
 
 ## How it works
 
@@ -228,7 +232,8 @@ Things the docs do not say, found by recording prod traffic:
 
 ## Known limits
 
-- **Output latency**: output is visible in 64 MiB blocks (see Output).
+- **Output latency**: bytes reach the file within ~1 s, but the unmodified starter reader
+  sees a chunk only once it is complete (64 MiB, or at shutdown / `--repair`).
 - **Timestamps** are the host's wall clock; on the test machine Kalshi's `sending_ts_ms`
   ran ~4 s ahead of it. A handful of microsecond-scale regressions occur at minute
   boundaries (a delta received just before `:00` but written just after the periodic
