@@ -36,8 +36,9 @@ generic exchange layer, latency experiments).
 
 ## Quick start
 
-Requirements: Linux (or WSL2) and stable Rust via `rustup` (CI builds with the latest
-stable; the crate uses edition 2024).
+Requirements: Linux (or WSL2) and `rustup`. `rust-toolchain.toml` pins Rust 1.88.0 (the
+minimum: the starter's `ergo-sbe` build dependency needs it), which rustup fetches on the
+first build; CI also builds and tests on the latest stable.
 
 ```bash
 cargo build --release
@@ -65,7 +66,8 @@ you prefer.
 
 ## Output
 
-Messages are written with the starter `AlignedSbeWriter` and decode with the starter
+Messages are encoded with the starter SBE encoders into exactly the bytes the starter
+`AlignedSbeWriter` produces (see *Chunking*) and decode with the starter
 `AlignedSbeReader<OrderbookSchema>`, unmodified (CI fails if anything under `src/util/`
 or `sbe_schemas/` differs from the tagged starter commit).
 
@@ -87,6 +89,23 @@ writes the bytes added to the current chunk, unpadded; a chunk is padded only wh
 full and at shutdown. So data is on disk within ~1 s and a crash loses at most a second.
 The starter reader loads complete chunks only: a capture cut off by `kill -9` is made
 readable with `verify capture.sbe --repair`, which zero-pads the last chunk.
+
+**Ordering and timestamps.**
+- Within a symbol, messages are in the order the collector processed them: updates in
+  the active source's arrival order, which is Kalshi's order on that socket (seq-checked).
+  Across symbols there is no ordering guarantee beyond "roughly by receive time".
+- `backtest_timestamp` / exchange-snapshot `received_at`: the host wall clock
+  (`SystemTime`, µs) read when the frame came off the socket, before UTF-8 or JSON work.
+  `exchange_timestamp`: Kalshi's `ts_ms` (deltas) or `sending_ts_ms` (snapshots), else the
+  receive time (counted in the report). Timeouts and rates use the monotonic clock.
+- Generated snapshots (minute, failover, removal, shutdown) are stamped with the
+  generation time, and a failover snapshot never earlier than the symbol's last output
+  (`max(new source's last receive, last output)`), so a symbol's time does not run back
+  at a switch.
+- The one known regression: the minute snapshot is stamped when the round starts, while
+  an update received microseconds earlier may be written just before it, so a symbol can
+  step back by under a millisecond at `:00`. The 6 h soak saw 5,154 of these in 411M
+  messages; `verify` reports them and does not fail on them.
 
 ## How it works
 
@@ -142,7 +161,11 @@ readable with `verify capture.sbe --repair`, which zero-pads the last chunk.
 
 ## Evidence
 
-All runs on live Kalshi prod unless noted; every capture checked with `verify`.
+All runs on live Kalshi prod unless noted; every capture checked with `verify`. Each
+challenge requirement is mapped to its tests and runs in
+[`docs/requirement-test-matrix.md`](docs/requirement-test-matrix.md); the soak and chaos
+summaries are in [`docs/evidence/`](docs/evidence/). End-to-end tests against a fake
+Kalshi that knows the true book are in `tests/e2e_fake_kalshi.rs`.
 
 | Run | Result |
 |---|---|
@@ -151,6 +174,7 @@ All runs on live Kalshi prod unless noted; every capture checked with `verify`.
 | 10 min, all markets, 2 replicas, one socket killed mid-run | 4,543 failovers, **0 gaps**; verify: 0 unexplained mismatches, 0 interval violations |
 | 2 hours through the fault proxy, 20,000 markets, a fault every ~2 min per socket (connection drops, single-frame drops, 3 s delays, silenced markets) | verify exit 0: 1.98M periodic snapshots checked, 0 unexplained mismatches, 0 interval violations. 152 dropped frames = 152 seq gaps detected; 61 dropped connections + 22 recycles = 83 reconnects. 1,673 gaps from overlapping faults on both replicas: median 0.1 s, max 1.6 s |
 | 30 min Polymarket, 4,170 books, 2 replicas | verify exit 0, 0 unexplained mismatches, 0 interval violations |
+| 5 min Polymarket from a clean GitHub runner (manual job `live-polymarket`, run 40240987412) | 500 books, 522,532 messages; verify ok, 0 unexplained mismatches |
 | Final soak: 6 hours, all markets (175,165 seen), 2 replicas, 63 sockets | SIGINT exit 0; 736M deltas, **0 seq gaps**, 0 decode errors, 0 crossed books; 25,627 markets removed as they settled; 470 scheduled socket recycles; 2,000+ short gaps (98.8% under 5 s, longest ~29 s, around 6 Kalshi "subscription buffer overflow" errors). verify: exit 0, 411M messages, 52.9M periodic snapshots checked, 0 unexplained mismatches, 0 interval violations |
 
 The same fault rate on all ~157k markets saturated the test machine's 28 MB/s link (every
@@ -240,9 +264,11 @@ Things the docs do not say, found by recording prod traffic:
   snapshot); `verify` reports them.
 - **Gaps** happen only when both replicas of a market are down at once (counted in the
   report). Under heavy fault injection they cluster after overlapping faults.
-- **Polymarket**: discovery covers the ~2,000 most active markets (Gamma refuses offsets
-  past ~2,000; keyset paging is the upgrade path), so it never removes markets by
-  discovery; Polymarket closes sockets that are not drained fast enough.
+- **Polymarket**: the collector subscribes the ~2,000 most active markets (~4k books;
+  Gamma refuses offsets past ~2,000). The complete listing (`/markets/keyset`, 243k
+  markets / 486k books, ~24 min to page) runs in the background and drives removals, so
+  a closed market goes ~25–50 min after closing (there is no lifecycle feed).
+  Polymarket closes sockets that are not drained fast enough.
 - Bandwidth: all markets with 2 replicas is ~15 MB/s of websocket traffic.
 
 ## Repository layout

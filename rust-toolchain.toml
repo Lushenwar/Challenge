@@ -1,0 +1,5 @@
+# The minimum that builds: the starter's ergo-sbe build dependency needs 1.88.
+# CI also runs clippy and tests on the latest stable.
+[toolchain]
+channel = "1.88.0"
+components = ["rustfmt", "clippy"]

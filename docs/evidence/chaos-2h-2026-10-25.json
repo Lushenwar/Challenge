@@ -1,0 +1,45 @@
+{
+ "run": "2-hour fault-proxy run, 20k Kalshi markets, 2 replicas (commit f130fcf)",
+ "command": "faultproxy --fault-every 120 --log faults.jsonl & engineering-challenge --ws-url ws://127.0.0.1:9000 --replicas 2 --max-markets 20000 > chaos.sbe 2> chaos.log (SIGINT after 2 h); verify chaos.sbe --events chaos.log",
+ "arbiter": {
+  "failovers": 769549,
+  "failovers_stale": 17162,
+  "gaps": 1673,
+  "gap_total_us": 27500759701,
+  "gap_max_us": 50057393,
+  "resubscribes_rate": 90705,
+  "recycles": 22
+ },
+ "proxy_faults": {
+  "drop_frame": 152,
+  "silence": 122,
+  "silence_lifted": 118,
+  "delay": 119,
+  "drop_conn": 61
+ },
+ "collector_exit_code": 0,
+ "verify": {
+  "events_loaded": 798559,
+  "explained_mismatches": 18410,
+  "gap_intervals": 0,
+  "interval_violations": 0,
+  "max_snapshot_interval_us": 60002456,
+  "messages": 48607201,
+  "min_snapshots_per_symbol": 2,
+  "ok": true,
+  "periodic_checked": 1981844,
+  "snapshots": 3218471,
+  "symbols": 20540,
+  "timestamp_regressions": 73,
+  "unexplained_mismatches": 0,
+  "updates": 45388730,
+  "updates_before_snapshot": 0
+ },
+ "verify_exit_code": 0,
+ "fault_match": [
+  "drop_conn 61 vs collector reconnects 83",
+  "drop_frame 152 vs collector seq gaps 152",
+  "silence 122 vs stale failovers 17162 (lag resubscribes 2107, lifted 118)",
+  "delay 119"
+ ]
+}
