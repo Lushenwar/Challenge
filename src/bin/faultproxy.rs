@@ -160,10 +160,10 @@ async fn relay(id: u64, tcp: tokio::net::TcpStream, s: Arc<Shared>) -> anyhow::R
             }
             msg = cr.next() => {
                 let Some(Ok(msg)) = msg else { break };
-                if let Message::Text(t) = &msg {
-                    if silenced.as_deref().is_some_and(|m| t.as_str().contains(m)) {
-                        s.fault(id, "silence_lifted", json!({"market": silenced.take()}));
-                    }
+                if let Message::Text(t) = &msg
+                    && silenced.as_deref().is_some_and(|m| t.as_str().contains(m))
+                {
+                    s.fault(id, "silence_lifted", json!({"market": silenced.take()}));
                 }
                 if uw.send(msg).await.is_err() {
                     break;
@@ -181,11 +181,11 @@ async fn relay(id: u64, tcp: tokio::net::TcpStream, s: Arc<Shared>) -> anyhow::R
                         tokio::time::sleep(s.delay).await;
                     }
                     _ => {
-                        if silenced.is_none() {
-                            if let Some(m) = last_ticker.clone() {
-                                s.fault(id, "silence", json!({"market": m}));
-                                silenced = Some(m);
-                            }
+                        if silenced.is_none()
+                            && let Some(m) = last_ticker.clone()
+                        {
+                            s.fault(id, "silence", json!({"market": m}));
+                            silenced = Some(m);
                         }
                     }
                 }

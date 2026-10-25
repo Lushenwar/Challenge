@@ -488,8 +488,10 @@ pub async fn run(
                         _ = stop.changed() => return st.stats,
                         Some(cmd) = cmds.recv() => {
                             for a in st.apply(cmd) {
-                                if let Action::Event(e) = a {
-                                    if events.send(e).await.is_err() { return st.stats }
+                                if let Action::Event(e) = a
+                                    && events.send(e).await.is_err()
+                                {
+                                    return st.stats;
                                 }
                             }
                         }
