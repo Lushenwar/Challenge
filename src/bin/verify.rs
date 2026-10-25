@@ -7,7 +7,9 @@
 //!   non-periodic cause for it (`--events`: subscribe, resync, exchange clear). Periodic
 //!   and shutdown snapshots are not logged per market, so they must always match.
 //! - Consecutive snapshots of a symbol are at most 61s apart while it is live (a
-//!   `Removed` snapshot ends it; a re-add starts it again).
+//!   `Removed` snapshot ends it; a re-add starts it again). A longer interval is
+//!   accepted only if the collector logged a gap (no valid source) inside it; those are
+//!   reported as `gap_intervals`.
 //! - `backtest_timestamp` regressions per symbol are reported (not fatal).
 //!
 //! Prints a JSON summary; exit 0 only if there is nothing unexplained.
@@ -46,6 +48,7 @@ struct Symbol {
     periodic_checked: u64,
     updates_before_snapshot: u64,
     interval_violations: u64,
+    gap_intervals: u64,
     max_interval_us: i64,
     timestamp_regressions: u64,
     #[serde(skip)]
@@ -80,11 +83,26 @@ fn read_events(path: &PathBuf) -> anyhow::Result<HashMap<(String, i64), String>>
     Ok(set)
 }
 
+/// Gap start times per market (`gap market=… since_us=…` lines).
+fn read_gaps(path: &PathBuf) -> anyhow::Result<HashMap<String, Vec<i64>>> {
+    let mut gaps: HashMap<String, Vec<i64>> = HashMap::new();
+    for line in std::fs::read_to_string(path)?.lines() {
+        if !line.contains(" gap: gap ") {
+            continue;
+        }
+        let field = |k: &str| line.split_whitespace().find_map(|t| t.strip_prefix(k));
+        if let (Some(m), Some(us)) = (field("market="), field("since_us=")) {
+            gaps.entry(m.to_owned()).or_default().push(us.parse()?);
+        }
+    }
+    Ok(gaps)
+}
+
 fn main() -> anyhow::Result<()> {
     let args = Args::parse();
-    let events = match &args.events {
-        Some(p) => read_events(p)?,
-        None => HashMap::new(),
+    let (events, gaps) = match &args.events {
+        Some(p) => (read_events(p)?, read_gaps(p)?),
+        None => (HashMap::new(), HashMap::new()),
     };
     let mut r = AlignedSbeReader::<OrderbookSchema>::open(&args.capture)?;
     let mut symbols: HashMap<String, Symbol> = HashMap::new();
@@ -118,7 +136,13 @@ fn main() -> anyhow::Result<()> {
                 }
                 if let Some(prev) = st.last_snapshot_us.filter(|_| !st.ended) {
                     st.max_interval_us = st.max_interval_us.max(at - prev);
-                    if at - prev > MAX_SNAPSHOT_INTERVAL_US {
+                    let in_gap = gaps.get(&s.symbol).is_some_and(|g| {
+                        g.iter()
+                            .any(|&t| prev - MAX_SNAPSHOT_INTERVAL_US <= t && t <= at)
+                    });
+                    if at - prev > MAX_SNAPSHOT_INTERVAL_US && in_gap {
+                        st.gap_intervals += 1;
+                    } else if at - prev > MAX_SNAPSHOT_INTERVAL_US {
                         st.interval_violations += 1;
                         if examples.len() < 10 {
                             examples.push(("interval", s.symbol.clone(), prev, at));
@@ -170,6 +194,7 @@ fn main() -> anyhow::Result<()> {
         "unexplained_mismatches": sum(|s| s.unexplained_mismatches),
         "updates_before_snapshot": sum(|s| s.updates_before_snapshot),
         "interval_violations": sum(|s| s.interval_violations),
+        "gap_intervals": sum(|s| s.gap_intervals),
         "max_snapshot_interval_us": symbols.values().map(|s| s.max_interval_us).max(),
         "timestamp_regressions": sum(|s| s.timestamp_regressions),
         "events_loaded": events.len(),

@@ -11,6 +11,11 @@ use crate::model::ConnId;
 /// Rule 1: a replica ahead of the active source for this long means the active one is
 /// stale for that market.
 pub const LAG_LIMIT_US: i64 = 2_000_000;
+/// Rule 1: this many markets going stale on one socket within `SOCKET_LAG_WINDOW_US`
+/// means the socket is lagging, not its subscriptions: fail over, but resubscribing each
+/// market would only add load (the socket catches up, or the silence rule reconnects it).
+pub const SOCKET_LAG_MARKETS: usize = 20;
+pub const SOCKET_LAG_WINDOW_US: i64 = 5_000_000;
 
 /// Rule 2: a rate below this percent of the baseline is a collapse.
 const COLLAPSE_PCT: i64 = 10;
@@ -41,6 +46,12 @@ pub struct Rate {
 impl Rate {
     pub fn hit(&mut self) {
         self.minute_count += 1;
+    }
+
+    /// Drop a minute in which the source was not valid throughout (pending, resyncing):
+    /// its count says nothing about the subscription's health.
+    pub fn skip_minute(&mut self) {
+        self.minute_count = 0;
     }
 
     /// Close a one-minute window. True = the rate collapsed below 10% of its baseline for

@@ -55,6 +55,8 @@ struct Source {
     /// carry the venue's send time, not an event time, so they do not count.
     delta_us: i64,
     rate: Rate,
+    /// Since when its book has been valid without interruption.
+    valid_since: Option<i64>,
 }
 
 #[derive(Default)]
@@ -109,11 +111,16 @@ pub struct Arbiter {
     /// Markets with a replica ahead of the active source.
     lagging: HashSet<String>,
     conns: BTreeSet<ConnId>,
+    /// Per socket: (window start, markets that went stale on it since).
+    stale_window: HashMap<ConnId, (i64, usize)>,
     recycler: Recycler,
     last_recycle_check: i64,
     /// `(market, cause, received_at)` of every non-periodic snapshot written; [`run`]
     /// logs them to stderr, where `verify --events` pairs them with the capture.
     pub snapshot_log: Vec<(String, SnapCause, i64)>,
+    /// `(market, since_us)` of every gap started (no valid source): logged by [`run`] so
+    /// `verify` can tell a gap from a missed snapshot.
+    pub gap_log: Vec<(String, i64)>,
     pub stats: ArbiterStats,
 }
 
@@ -146,6 +153,9 @@ impl Arbiter {
                     .max();
                 let src = m.sources.entry(conn).or_default();
                 src.delta_us = src.delta_us.max(caught_up.unwrap_or(0));
+                if src.book.is_none() {
+                    src.valid_since = Some(recv_us);
+                }
                 src.book = Some(book);
                 src.exch_us = exch_us;
                 src.recv_us = recv_us;
@@ -248,6 +258,7 @@ impl Arbiter {
         let mut last_data = 0;
         if let Some(src) = m.sources.get_mut(&conn) {
             src.book = None;
+            src.valid_since = None;
             last_data = src.recv_us;
         }
         if m.active != Some(conn) || m.removed {
@@ -275,17 +286,24 @@ impl Arbiter {
                 );
             }
             None => {
+                // Timed from the last output (a quiet market's last data can be hours
+                // old), so the reported duration is real and the logged start falls
+                // inside the snapshot interval `verify` sees stretched by the gap.
+                let since = last_data.max(m.last_out_us);
                 m.active = None;
-                m.gap_since = Some(last_data);
+                m.gap_since = Some(since);
+                self.gap_log.push((market.to_owned(), since));
             }
         }
     }
 
     /// Health rules 1 and 4; call often (every 250 ms).
     pub fn on_tick(&mut self, now_us: i64, out: &mut Vec<OutMsg>) {
+        // Which markets are due to fail over, and onto what.
+        let mut due: Vec<(String, ConnId, ConnId)> = Vec::new();
         let lagging: Vec<String> = self.lagging.drain().collect();
         for market in lagging {
-            let Some(m) = self.markets.get_mut(&market) else {
+            let Some(m) = self.markets.get(&market) else {
                 continue;
             };
             let (Some(since), Some(stale), false) = (m.lag_since, m.active, m.removed) else {
@@ -301,7 +319,30 @@ impl Arbiter {
                 .filter(|(c, s)| **c != stale && s.book.is_some())
                 .max_by_key(|(c, s)| (s.delta_us, std::cmp::Reverse(**c)))
                 .map(|(c, _)| *c);
-            let Some(next) = next else { continue };
+            if let Some(next) = next {
+                due.push((market, stale, next));
+            }
+        }
+        // Markets on one socket go stale over a few checks, not all in one: count them
+        // over a short window.
+        let mut socket_wide: HashSet<ConnId> = HashSet::new();
+        for (_, stale, _) in &due {
+            let w = self.stale_window.entry(*stale).or_insert((now_us, 0));
+            if now_us - w.0 > health::SOCKET_LAG_WINDOW_US {
+                *w = (now_us, 0);
+            }
+            w.1 += 1;
+            if w.1 >= health::SOCKET_LAG_MARKETS && socket_wide.insert(*stale) {
+                tracing::warn!(
+                    conn = stale,
+                    markets = w.1,
+                    "socket-wide lag; failing over without resubscribes"
+                );
+            }
+        }
+        due.sort();
+        for (market, stale, next) in due {
+            let m = self.markets.get_mut(&market).expect("collected above");
             m.lag_since = None;
             m.active = Some(next);
             let at = m.sources[&next].recv_us.max(m.last_out_us);
@@ -319,12 +360,14 @@ impl Arbiter {
             );
             self.stats.failovers += 1;
             self.stats.failovers_stale += 1;
-            self.stats.resubscribes_lag += 1;
-            tracing::warn!(%market, stale, next, "active source fell behind; failed over");
-            self.control.push(ControlMsg::Resubscribe {
-                conn: stale,
-                market,
-            });
+            if !socket_wide.contains(&stale) {
+                self.stats.resubscribes_lag += 1;
+                tracing::warn!(%market, stale, next, "active source fell behind; failed over");
+                self.control.push(ControlMsg::Resubscribe {
+                    conn: stale,
+                    market,
+                });
+            }
         }
         if now_us - self.last_recycle_check >= 10_000_000 {
             self.last_recycle_check = now_us;
@@ -364,6 +407,11 @@ impl Arbiter {
             let valid = m.sources.values().filter(|s| s.book.is_some()).count();
             let active = m.active;
             for (conn, src) in &mut m.sources {
+                let steady = src.valid_since.is_some_and(|t| now_us - t >= 60_000_000);
+                if !steady {
+                    src.rate.skip_minute();
+                    continue;
+                }
                 let collapsed = src.rate.on_minute(now_us);
                 let spare = active != Some(*conn) || valid == 1;
                 if collapsed && src.book.is_some() && spare {
@@ -498,6 +546,9 @@ pub async fn run(
         }
         for (market, cause, at) in a.snapshot_log.drain(..) {
             log_snapshot(&market, cause, at);
+        }
+        for (market, since_us) in a.gap_log.drain(..) {
+            tracing::info!(target: "gap", %market, since_us, "gap");
         }
         send_all(&writer, &mut buf, &mut a.stats);
         for msg in a.control.drain(..) {
@@ -755,6 +806,74 @@ mod tests {
         a.on_event(update(0, 7, 4_000), &mut out);
         a.on_tick(60_000_000, &mut out);
         assert_eq!(a.stats.failovers_stale, 0);
+    }
+
+    /// Found in the chaos run: a socket-wide stall (every market on it at once) fails
+    /// over without a resubscribe per market.
+    #[test]
+    fn socket_wide_lag_fails_over_without_per_market_resubscribes() {
+        let mut a = Arbiter::default();
+        let mut out = Vec::new();
+        let n = health::SOCKET_LAG_MARKETS + 5;
+        for i in 0..n {
+            let m = format!("M{i}");
+            for conn in [0, 1] {
+                a.on_event(
+                    ConnEvent::Snapshot {
+                        conn,
+                        market: m.clone(),
+                        book: book(400_000),
+                        recv_us: 1,
+                        exch_us: 1,
+                        cause: SnapCause::Subscribed,
+                    },
+                    &mut out,
+                );
+            }
+            // Only the replica (conn 1) receives the next delta: conn 0 is stalled.
+            a.on_event(
+                ConnEvent::Update {
+                    conn: 1,
+                    market: m,
+                    side: Side::Buy,
+                    price: 400_000,
+                    qty: 2,
+                    recv_us: 1_000,
+                    exch_us: 1_000,
+                },
+                &mut out,
+            );
+        }
+        a.on_tick(1_000 + health::LAG_LIMIT_US, &mut out);
+        assert_eq!(a.stats.failovers_stale, n as u64);
+        assert!(a.control.is_empty(), "{:?}", a.control);
+    }
+
+    /// Found in the chaos run: a source that was pending for part of the minute is not
+    /// a collapsed subscription.
+    #[test]
+    fn rate_rule_skips_minutes_a_source_was_not_valid_throughout() {
+        const MIN: i64 = 60_000_000;
+        let mut a = Arbiter::default();
+        let mut out = Vec::new();
+        a.on_event(snap(0, 400_000, 1), &mut out);
+        for minute in 0..10 {
+            for i in 0..100 {
+                a.on_event(update(0, i + 1, minute * MIN + i), &mut out);
+            }
+            a.health_minute((minute + 1) * MIN);
+        }
+        // Invalid, then valid again 30s into the quiet minute.
+        a.on_event(
+            ConnEvent::Invalidated {
+                conn: 0,
+                market: "T".into(),
+            },
+            &mut out,
+        );
+        a.on_event(snap(0, 400_000, 10 * MIN + 30_000_000), &mut out);
+        a.health_minute(11 * MIN);
+        assert!(a.control.is_empty(), "{:?}", a.control);
     }
 
     /// Phase 7 (c): a socket is never recycled while one of its markets has no other
