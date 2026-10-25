@@ -19,7 +19,7 @@ use tokio_tungstenite::tungstenite::{Message, client::IntoClientRequest, http::H
 use crate::{
     book::OrderBook,
     exchange::kalshi::{
-        Env, WS_PATH,
+        WS_PATH,
         auth::Signer,
         codec::{Decoded, decode},
     },
@@ -465,7 +465,8 @@ impl ConnState {
 /// How to start a connection task.
 pub struct Spec {
     pub conn: ConnId,
-    pub env: Env,
+    /// Websocket URL (Kalshi's, or a local fault proxy's).
+    pub ws_url: String,
     pub signer: Arc<Signer>,
     pub tickers: Vec<String>,
     pub lifecycle: bool,
@@ -480,7 +481,7 @@ pub async fn run(
 ) -> ConnStats {
     let Spec {
         conn,
-        env,
+        ws_url,
         signer,
         tickers,
         lifecycle,
@@ -488,7 +489,7 @@ pub async fn run(
     let mut st = ConnState::new(conn, &tickers, lifecycle);
     let mut backoff = Duration::from_secs(1);
     while !*stop.borrow() {
-        let mut ws = match connect(env, &signer).await {
+        let mut ws = match connect(&ws_url, &signer).await {
             Ok(ws) => ws,
             Err(e) => {
                 // ponytail: jitter from the clock's low bits; add `rand` if it ever matters.
@@ -583,11 +584,12 @@ pub async fn run(
     st.stats
 }
 
-type Ws =
+pub type Ws =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
-async fn connect(env: Env, signer: &Signer) -> anyhow::Result<Ws> {
-    let mut req = env.ws().into_client_request()?;
+/// Open a websocket with Kalshi's signed handshake headers.
+pub async fn connect(url: &str, signer: &Signer) -> anyhow::Result<Ws> {
+    let mut req = url.into_client_request()?;
     for (name, value) in signer.headers("GET", WS_PATH) {
         req.headers_mut()
             .insert(name, HeaderValue::from_str(&value)?);

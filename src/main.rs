@@ -32,6 +32,9 @@ struct Args {
     /// Sockets each market is collected on (failover needs at least 2).
     #[arg(long, default_value_t = 2)]
     replicas: usize,
+    /// Connect here instead of Kalshi (e.g. `ws://127.0.0.1:9000` for faultproxy).
+    #[arg(long)]
+    ws_url: Option<String>,
     /// Test hook: drop socket N after S seconds, as `N@S`.
     #[arg(long, value_parser = parse_drop)]
     drop_conn: Option<(usize, Duration)>,
@@ -78,6 +81,7 @@ async fn collect(args: Args) -> anyhow::Result<()> {
     let (stop_tx, stop_rx) = watch::channel(false);
     let cfg = control::Config {
         env: args.env,
+        ws_url: args.ws_url,
         signer,
         markets_per_socket: args.markets_per_socket,
         replicas: args.replicas,

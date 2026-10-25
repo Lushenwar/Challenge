@@ -35,6 +35,8 @@ const TOMBSTONE: Duration = Duration::from_secs(600);
 
 pub struct Config {
     pub env: Env,
+    /// Websocket URL override (a local fault proxy); `None` = the environment's.
+    pub ws_url: Option<String>,
     pub signer: Arc<Signer>,
     pub markets_per_socket: usize,
     /// Sockets each market is collected on.
@@ -230,7 +232,11 @@ impl Control {
         let (tx, rx) = mpsc::unbounded_channel();
         let spec = conn::Spec {
             conn,
-            env: self.cfg.env,
+            ws_url: self
+                .cfg
+                .ws_url
+                .clone()
+                .unwrap_or_else(|| self.cfg.env.ws().to_owned()),
             signer: self.cfg.signer.clone(),
             tickers,
             // Two connections carry the (market-global) lifecycle feed, for redundancy.
