@@ -12,12 +12,7 @@ use serde_json::Value;
 const PAGE_LIMIT: u32 = 1000;
 const PAGE_RETRIES: u32 = 5;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MarketInfo {
-    pub ticker: String,
-    /// Whole contracts traded in the last 24h (fraction dropped); for ranking only.
-    pub volume_24h: u64,
-}
+pub use crate::exchange::MarketInfo;
 
 #[derive(Deserialize)]
 struct Page {

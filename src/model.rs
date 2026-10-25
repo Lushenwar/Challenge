@@ -5,7 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::{
     Side,
     book::OrderBook,
-    exchange::kalshi::codec::Lifecycle,
+    exchange::Lifecycle,
     util::dtos::challenge_orderbook::{PriceLevelUpdateDomain, SnapshotDomain},
 };
 

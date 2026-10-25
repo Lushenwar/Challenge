@@ -47,12 +47,12 @@ struct Source {
     /// `None` = Pending or Invalid on that connection.
     book: Option<OrderBook>,
     /// Exchange time of the latest event this source applied: the freshness signal
-    /// (Kalshi frames carry no per-market clock).
+    /// (venue frames carry no per-market clock).
     exch_us: i64,
     /// Local receive time of that event.
     recv_us: i64,
     /// Exchange time of the latest *delta*: what replicas are compared on. Snapshots
-    /// carry Kalshi's send time, not an event time, so they do not count.
+    /// carry the venue's send time, not an event time, so they do not count.
     delta_us: i64,
     rate: Rate,
 }

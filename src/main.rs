@@ -1,28 +1,19 @@
-//! Kalshi order-book collector: SBE deltas plus minute snapshots on stdout, logs and the
-//! final JSON report on stderr.
+//! Prediction-market order-book collector: SBE deltas plus minute snapshots on stdout,
+//! logs and the final JSON report on stderr.
 
-use std::{io::Write, path::PathBuf, sync::Arc, time::Duration};
+use std::{io::Write, path::PathBuf, time::Duration};
 
 use anyhow::Context;
 use clap::Parser;
-use engineering_challenge::{
-    arbiter, control,
-    exchange::kalshi::{Env, auth::Signer, discovery},
-    model::now_us,
-    writer,
-};
+use engineering_challenge::{arbiter, control, exchange, model::now_us, writer};
 use serde_json::json;
 use tokio::sync::{mpsc, watch};
 
 #[derive(Parser)]
-#[command(about = "Kalshi order books → SBE on stdout")]
+#[command(about = "Prediction-market order books → SBE on stdout")]
 struct Args {
-    #[arg(long, value_enum, default_value = "prod")]
-    env: Env,
-    #[arg(long, env = "KALSHI_API_KEY_ID")]
-    key_id: String,
-    #[arg(long, env = "KALSHI_PRIVATE_KEY_PATH")]
-    key_path: PathBuf,
+    #[command(flatten)]
+    venue: exchange::Args,
     /// Only collect the N most active markets (by 24h volume). Default: all live markets.
     #[arg(long)]
     max_markets: Option<usize>,
@@ -32,7 +23,7 @@ struct Args {
     /// Sockets each market is collected on (failover needs at least 2).
     #[arg(long, default_value_t = 2)]
     replicas: usize,
-    /// Connect here instead of Kalshi (e.g. `ws://127.0.0.1:9000` for faultproxy).
+    /// Connect here instead of the venue (e.g. `ws://127.0.0.1:9000` for faultproxy).
     #[arg(long)]
     ws_url: Option<String>,
     /// Test hook: drop socket N after S seconds, as `N@S`.
@@ -69,20 +60,24 @@ fn main() -> anyhow::Result<()> {
 
 async fn collect(args: Args) -> anyhow::Result<()> {
     let started_us = now_us();
-    let signer = Arc::new(Signer::from_file(args.key_id.clone(), &args.key_path)?);
-    let markets = discovery::discover(&reqwest::Client::new(), args.env.rest())
+    let exchange = args.venue.build()?;
+    let markets = exchange
+        .discover(&reqwest::Client::new())
         .await
         .context("initial discovery")?;
-    tracing::info!(markets = markets.len(), "discovered");
+    tracing::info!(
+        venue = exchange.name(),
+        markets = markets.len(),
+        "discovered"
+    );
 
     let (out_tx, writer) = writer::spawn(args.output.clone())?;
     let (ev_tx, ev_rx) = mpsc::channel(100_000);
     let (ctl_tx, ctl_rx) = mpsc::unbounded_channel();
     let (stop_tx, stop_rx) = watch::channel(false);
     let cfg = control::Config {
-        env: args.env,
+        exchange,
         ws_url: args.ws_url,
-        signer,
         markets_per_socket: args.markets_per_socket,
         replicas: args.replicas,
         drop_conn: args.drop_conn,

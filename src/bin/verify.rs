@@ -6,13 +6,14 @@
 //! - A later snapshot must equal the rebuilt book, unless the collector logged a
 //!   non-periodic cause for it (`--events`: subscribe, resync, exchange clear). Periodic
 //!   and shutdown snapshots are not logged per market, so they must always match.
-//! - Consecutive snapshots of a symbol are at most 61s apart.
+//! - Consecutive snapshots of a symbol are at most 61s apart while it is live (a
+//!   `Removed` snapshot ends it; a re-add starts it again).
 //! - `backtest_timestamp` regressions per symbol are reported (not fatal).
 //!
 //! Prints a JSON summary; exit 0 only if there is nothing unexplained.
 
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, HashMap},
     io::Write,
     path::PathBuf,
 };
@@ -51,13 +52,16 @@ struct Symbol {
     book: Option<Book>,
     #[serde(skip)]
     last_snapshot_us: Option<i64>,
+    /// The last snapshot was a removal: the symbol was not live until this one.
+    #[serde(skip)]
+    ended: bool,
     #[serde(skip)]
     last_ts: i64,
 }
 
-/// `(market, recv_us)` of every snapshot the collector logged with a cause.
-fn read_events(path: &PathBuf) -> anyhow::Result<HashSet<(String, i64)>> {
-    let mut set = HashSet::new();
+/// `(market, recv_us) -> cause` of every snapshot the collector logged with a cause.
+fn read_events(path: &PathBuf) -> anyhow::Result<HashMap<(String, i64), String>> {
+    let mut set = HashMap::new();
     for line in std::fs::read_to_string(path)?.lines() {
         if !line.contains(" snapshot: snapshot ") {
             continue;
@@ -67,8 +71,10 @@ fn read_events(path: &PathBuf) -> anyhow::Result<HashSet<(String, i64)>> {
                 .find_map(|t| t.strip_prefix(k))
                 .map(str::to_owned)
         };
-        if let (Some(m), Some(us)) = (field("market="), field("recv_us=")) {
-            set.insert((m, us.parse()?));
+        if let (Some(m), Some(us), Some(cause)) =
+            (field("market="), field("recv_us="), field("cause="))
+        {
+            set.insert((m, us.parse()?), cause);
         }
     }
     Ok(set)
@@ -78,7 +84,7 @@ fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     let events = match &args.events {
         Some(p) => read_events(p)?,
-        None => HashSet::new(),
+        None => HashMap::new(),
     };
     let mut r = AlignedSbeReader::<OrderbookSchema>::open(&args.capture)?;
     let mut symbols: HashMap<String, Symbol> = HashMap::new();
@@ -96,7 +102,8 @@ fn main() -> anyhow::Result<()> {
                 let mut snap = Book::new();
                 snap.extend(s.bids.iter().map(|l| ((0, l.price_level), l.quantity)));
                 snap.extend(s.asks.iter().map(|l| ((1, l.price_level), l.quantity)));
-                let explained = events.contains(&(s.symbol.clone(), at));
+                let cause = events.get(&(s.symbol.clone(), at));
+                let explained = cause.is_some();
                 if let Some(book) = &st.book {
                     if !explained {
                         st.periodic_checked += 1;
@@ -109,7 +116,7 @@ fn main() -> anyhow::Result<()> {
                         }
                     }
                 }
-                if let Some(prev) = st.last_snapshot_us {
+                if let Some(prev) = st.last_snapshot_us.filter(|_| !st.ended) {
                     st.max_interval_us = st.max_interval_us.max(at - prev);
                     if at - prev > MAX_SNAPSHOT_INTERVAL_US {
                         st.interval_violations += 1;
@@ -119,6 +126,7 @@ fn main() -> anyhow::Result<()> {
                     }
                 }
                 st.last_snapshot_us = Some(at);
+                st.ended = cause.is_some_and(|c| c == "Removed");
                 st.book = Some(snap);
                 if check_ts(st, at) && examples.len() < 10 {
                     examples.push(("regression_snapshot", s.symbol.clone(), st.last_ts, at));

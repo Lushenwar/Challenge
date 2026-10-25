@@ -1,6 +1,6 @@
 //! Chaos websocket proxy. The collector connects here (`--ws-url ws://127.0.0.1:9000`);
-//! each client connection is relayed to Kalshi over its own signed upstream socket, and
-//! faults are injected at random per connection:
+//! each client connection is relayed to the venue over its own (signed) upstream socket,
+//! and faults are injected at random per connection:
 //!
 //! - `drop_conn`: close both sides.
 //! - `drop_frame`: swallow one `orderbook_delta` (the collector sees a seq gap).
@@ -21,7 +21,7 @@ use std::{
 use clap::Parser;
 use engineering_challenge::{
     conn,
-    exchange::kalshi::{Env, auth::Signer},
+    exchange::{self, Exchange},
 };
 use futures_util::{SinkExt, StreamExt};
 use serde_json::json;
@@ -32,12 +32,8 @@ use tokio_tungstenite::tungstenite::Message;
 struct Args {
     #[arg(long, default_value = "127.0.0.1:9000")]
     listen: String,
-    #[arg(long, value_enum, default_value = "prod")]
-    env: Env,
-    #[arg(long, env = "KALSHI_API_KEY_ID")]
-    key_id: String,
-    #[arg(long, env = "KALSHI_PRIVATE_KEY_PATH")]
-    key_path: PathBuf,
+    #[command(flatten)]
+    venue: exchange::Args,
     /// Mean seconds between faults on each connection.
     #[arg(long, default_value_t = 120)]
     fault_every: u64,
@@ -49,8 +45,7 @@ struct Args {
 }
 
 struct Shared {
-    env: Env,
-    signer: Signer,
+    exchange: Arc<dyn Exchange>,
     fault_every: Duration,
     delay: Duration,
     log: Mutex<std::fs::File>,
@@ -96,8 +91,7 @@ async fn main() -> anyhow::Result<()> {
         .init();
     let args = Args::parse();
     let shared = Arc::new(Shared {
-        env: args.env,
-        signer: Signer::from_file(args.key_id.clone(), &args.key_path)?,
+        exchange: args.venue.build()?,
         fault_every: Duration::from_secs(args.fault_every),
         delay: Duration::from_millis(args.delay_ms),
         log: Mutex::new(std::fs::File::create(&args.log)?),
@@ -119,7 +113,7 @@ async fn main() -> anyhow::Result<()> {
 
 async fn relay(id: u64, tcp: tokio::net::TcpStream, s: Arc<Shared>) -> anyhow::Result<()> {
     let client = tokio_tungstenite::accept_async(tcp).await?;
-    let upstream = conn::connect(s.env.ws(), &s.signer).await?;
+    let upstream = conn::connect(s.exchange.ws_request(None)?).await?;
     let (mut cw, mut cr) = client.split();
     let (mut uw, mut ur) = upstream.split();
     let mut rng = Rng(now_us() as u64 ^ id.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);

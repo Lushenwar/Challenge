@@ -69,18 +69,7 @@ pub enum Decoded {
     },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Lifecycle {
-    Created,
-    Activated,
-    /// `deactivated` with `is_deactivated: true`. Removes the market.
-    Deactivated,
-    /// `deactivated` with `is_deactivated: false`: trading resumed.
-    Reactivated,
-    Determined,
-    Settled,
-    Other(String),
-}
+pub use crate::exchange::Lifecycle;
 
 impl Decoded {
     /// `(sid, seq)` for frames that take part in a subscription's sequence.

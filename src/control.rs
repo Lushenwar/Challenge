@@ -17,12 +17,7 @@ use tokio::{
 
 use crate::{
     conn::{self, ConnCmd, ConnStats},
-    exchange::kalshi::{
-        Env,
-        auth::Signer,
-        codec::Lifecycle,
-        discovery::{self, MarketInfo},
-    },
+    exchange::{Exchange, Lifecycle, MarketInfo},
     model::{ConnEvent, ConnId, ControlMsg},
     planner::Planner,
 };
@@ -34,10 +29,9 @@ const STAGGER: Duration = Duration::from_millis(250);
 const TOMBSTONE: Duration = Duration::from_secs(600);
 
 pub struct Config {
-    pub env: Env,
-    /// Websocket URL override (a local fault proxy); `None` = the environment's.
+    pub exchange: Arc<dyn Exchange>,
+    /// Websocket URL override (a local fault proxy); `None` = the venue's.
     pub ws_url: Option<String>,
-    pub signer: Arc<Signer>,
     pub markets_per_socket: usize,
     /// Sockets each market is collected on.
     pub replicas: usize,
@@ -101,8 +95,10 @@ pub async fn run(
     loop {
         tokio::select! {
             _ = &mut next, if pass.is_none() => {
-                let (client, base) = (reqwest::Client::new(), c.cfg.env.rest());
-                pass = Some(tokio::spawn(async move { discovery::discover(&client, base).await }));
+                let exchange = c.cfg.exchange.clone();
+                pass = Some(tokio::spawn(async move {
+                    exchange.discover(&reqwest::Client::new()).await
+                }));
             }
             res = async { pass.as_mut().expect("guarded").await }, if pass.is_some() => {
                 pass = None;
@@ -166,7 +162,8 @@ impl Control {
         self.stats.discovery_passes += 1;
         let live: HashSet<String> = markets.iter().map(|m| m.ticker.clone()).collect();
         let mut gone = Vec::new();
-        for m in self.planner.markets() {
+        let complete = self.cfg.exchange.discovery_is_complete();
+        for m in self.planner.markets().filter(|_| complete) {
             if live.contains(m) {
                 self.misses.remove(m);
             } else {
@@ -232,12 +229,8 @@ impl Control {
         let (tx, rx) = mpsc::unbounded_channel();
         let spec = conn::Spec {
             conn,
-            ws_url: self
-                .cfg
-                .ws_url
-                .clone()
-                .unwrap_or_else(|| self.cfg.env.ws().to_owned()),
-            signer: self.cfg.signer.clone(),
+            exchange: self.cfg.exchange.clone(),
+            ws_url: self.cfg.ws_url.clone(),
             tickers,
             // Two connections carry the (market-global) lifecycle feed, for redundancy.
             lifecycle: conn < 2,

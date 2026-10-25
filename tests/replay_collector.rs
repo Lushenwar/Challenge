@@ -13,6 +13,17 @@ use engineering_challenge::{
 };
 use serde::Deserialize;
 
+/// A Kalshi session for frame handling; its key only signs handshakes, never used here.
+fn kalshi_session() -> Box<dyn engineering_challenge::exchange::Session> {
+    use ed25519_dalek::{SigningKey, pkcs8::EncodePrivateKey};
+    use engineering_challenge::exchange::{Exchange, kalshi};
+    let pem = SigningKey::from_bytes(&[1; 32])
+        .to_pkcs8_pem(Default::default())
+        .unwrap();
+    let signer = kalshi::auth::Signer::new("test".into(), &pem).unwrap();
+    kalshi::Kalshi::new(kalshi::Env::Prod, signer).session(false)
+}
+
 const FIXTURE: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/fixtures/kalshi/prod-2026-10-24.jsonl"
@@ -56,7 +67,7 @@ fn run_pipeline(conns: &[usize]) -> (Vec<OutMsg>, String, ArbiterStats) {
                 .collect();
             tickers.sort();
             tickers.dedup();
-            (c, ConnState::new(c, &tickers, false))
+            (c, ConnState::new(c, &tickers, kalshi_session()))
         })
         .collect();
     let mut arb = Arbiter::default();

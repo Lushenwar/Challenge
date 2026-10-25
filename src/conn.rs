@@ -1,5 +1,6 @@
-//! One websocket connection: subscribe, check `seq` per sid, keep its own copy of every
-//! book, and report facts to the arbiter. It never decides what is written.
+//! One websocket connection: subscribe, check `seq` per sid (where the venue has it),
+//! keep its own copy of every book, and report facts to the arbiter. It never decides
+//! what is written. Venue specifics come from its [`Session`].
 //!
 //! [`ConnState`] is the pure per-frame logic (driven by replay tests); [`run`] is the
 //! socket loop around it.
@@ -12,26 +13,18 @@ use std::{
 
 use futures_util::{SinkExt, StreamExt};
 use serde::Serialize;
-use serde_json::json;
 use tokio::sync::{mpsc, watch};
-use tokio_tungstenite::tungstenite::{Message, client::IntoClientRequest, http::HeaderValue};
+use tokio_tungstenite::tungstenite::{Message, handshake::client::Request};
 
 use crate::{
     book::OrderBook,
-    exchange::kalshi::{
-        WS_PATH,
-        auth::Signer,
-        codec::{Decoded, decode},
-    },
+    exchange::{Change, Decoded, Exchange, Session},
     model::{ConnEvent, ConnId, SnapCause, now_us},
 };
 
-/// Markets per `subscribe` / `update_subscription` command. Kalshi accepted 20,000 in
-/// one command; smaller batches keep each frame modest.
-const BATCH: usize = 1000;
 /// A requested resync that has not arrived after this long means the subscription is
 /// broken: reconnect.
-const RESYNC_TIMEOUT_US: i64 = 15_000_000;
+pub const RESYNC_TIMEOUT_US: i64 = 15_000_000;
 const PING_EVERY: Duration = Duration::from_secs(10);
 /// No frame of any kind (data, ping, pong) for this long = a dead socket. Not "no pong
 /// within 10s": a pong queues behind bulk data (a socket's initial snapshots can take
@@ -50,24 +43,25 @@ pub struct ConnStats {
     pub bad_deltas: u64,
     pub decode_errors: u64,
     pub resync_requests: u64,
+    pub resubscribes: u64,
     pub exch_ts_fallbacks: u64,
     pub crossed: u64,
     pub stalls: u64,
-    /// Kalshi `error` frames by code.
+    /// Venue `error` frames by code.
     pub errors: BTreeMap<i64, u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
     Event(ConnEvent),
-    /// A JSON command to send on the socket.
+    /// A command to send on the socket.
     Send(String),
 }
 
 #[derive(Default)]
 struct Market {
     sid: Option<u64>,
-    /// Its subscription snapshot has arrived, so its deltas are flowing.
+    /// Its subscription snapshot has arrived, so its level updates are flowing.
     streaming: bool,
     /// `None` = Pending or Invalid.
     book: Option<OrderBook>,
@@ -78,17 +72,13 @@ pub struct ConnState {
     conn: ConnId,
     markets: HashMap<String, Market>,
     next_seq: HashMap<u64, u64>,
-    next_id: u64,
-    /// Also subscribe to `market_lifecycle_v2` (all markets) on this connection.
-    lifecycle: bool,
     connected: bool,
-    /// The order-book subscription's sid (one per connection: subscribes merge).
-    ob_sid: Option<u64>,
+    session: Box<dyn Session>,
     pub stats: ConnStats,
 }
 
 impl ConnState {
-    pub fn new(conn: ConnId, tickers: &[String], lifecycle: bool) -> Self {
+    pub fn new(conn: ConnId, tickers: &[String], session: Box<dyn Session>) -> Self {
         Self {
             conn,
             markets: tickers
@@ -96,10 +86,8 @@ impl ConnState {
                 .map(|t| (t.clone(), Market::default()))
                 .collect(),
             next_seq: HashMap::new(),
-            next_id: 0,
-            lifecycle,
             connected: false,
-            ob_sid: None,
+            session,
             stats: ConnStats::default(),
         }
     }
@@ -107,40 +95,21 @@ impl ConnState {
     /// Commands for a fresh connection. Every market becomes Pending.
     pub fn subscribe_cmds(&mut self) -> Vec<String> {
         self.next_seq.clear();
-        self.ob_sid = None;
         self.connected = true;
         self.markets
             .values_mut()
             .for_each(|m| *m = Market::default());
         let mut tickers: Vec<String> = self.markets.keys().cloned().collect();
         tickers.sort();
-        let mut cmds = Vec::new();
-        if self.lifecycle {
-            self.next_id += 1;
-            cmds.push(
-                json!({"id": self.next_id, "cmd": "subscribe",
-                    "params": {"channels": ["market_lifecycle_v2"]}})
-                .to_string(),
-            );
-        }
-        cmds.extend(self.orderbook_subscribe(&tickers));
-        cmds
+        self.session.on_connect(&tickers)
     }
 
     pub fn disconnected(&mut self) {
         self.connected = false;
     }
 
-    fn orderbook_subscribe(&mut self, tickers: &[String]) -> Vec<String> {
-        tickers
-            .chunks(BATCH)
-            .map(|chunk| {
-                self.next_id += 1;
-                json!({"id": self.next_id, "cmd": "subscribe",
-                    "params": {"channels": ["orderbook_delta"], "market_tickers": chunk}})
-                .to_string()
-            })
-            .collect()
+    pub fn keepalive(&self) -> Message {
+        self.session.keepalive()
     }
 
     /// Start collecting `tickers`. Returns the commands to send now (none while
@@ -154,14 +123,14 @@ impl ConnState {
             self.markets.insert(t.clone(), Market::default());
         }
         if self.connected {
-            self.orderbook_subscribe(&new)
+            self.session.subscribe(&new)
         } else {
             Vec::new()
         }
     }
 
-    /// Drop and re-request `tickers` (`delete_markets` then `subscribe`). Each becomes
-    /// Pending; an `Invalidated` event goes out for any that had a valid book.
+    /// Drop and re-request `tickers`. Each becomes Pending; an `Invalidated` event goes
+    /// out for any that had a valid book.
     pub fn resubscribe(&mut self, tickers: Vec<String>) -> Vec<Action> {
         let mut out = Vec::new();
         let known: Vec<String> = tickers
@@ -181,24 +150,18 @@ impl ConnState {
         if !self.connected || known.is_empty() {
             return out; // the next connect subscribes them anyway
         }
-        if let Some(sid) = self.ob_sid {
-            self.next_id += 1;
-            out.push(Action::Send(
-                json!({"id": self.next_id, "cmd": "update_subscription",
-                    "params": {"sids": [sid], "market_tickers": known, "action": "delete_markets"}})
-                .to_string(),
-            ));
-        }
-        out.extend(
-            self.orderbook_subscribe(&known)
-                .into_iter()
-                .map(Action::Send),
-        );
+        self.stats.resubscribes += 1;
+        let cmds = self
+            .session
+            .unsubscribe(&known)
+            .into_iter()
+            .chain(self.session.subscribe(&known));
+        out.extend(cmds.map(Action::Send));
         out
     }
 
     /// Stop collecting `tickers`: a `Removed` event per market (in order with every
-    /// earlier event) and a `delete_markets` command.
+    /// earlier event) and the unsubscribe commands.
     pub fn remove_markets(&mut self, tickers: &[String]) -> Vec<Action> {
         let gone: Vec<String> = tickers
             .iter()
@@ -214,17 +177,13 @@ impl ConnState {
                 })
             })
             .collect();
-        // ponytail: before the sid is known the delete is skipped; frames for an unknown
-        // market are ignored anyway, and the next reconnect will not subscribe it.
-        if let (true, Some(sid)) = (self.connected, self.ob_sid) {
-            for chunk in gone.chunks(BATCH) {
-                self.next_id += 1;
-                out.push(Action::Send(
-                    json!({"id": self.next_id, "cmd": "update_subscription",
-                        "params": {"sids": [sid], "market_tickers": chunk, "action": "delete_markets"}})
-                    .to_string(),
-                ));
-            }
+        if self.connected && !gone.is_empty() {
+            out.extend(
+                self.session
+                    .unsubscribe(&gone)
+                    .into_iter()
+                    .map(Action::Send),
+            );
         }
         out
     }
@@ -240,15 +199,22 @@ impl ConnState {
     pub fn on_frame(&mut self, text: &str, recv_us: i64) -> Vec<Action> {
         self.stats.frames += 1;
         let mut out = Vec::new();
-        let d = match decode(text) {
-            Ok(d) => d,
+        match self.session.decode(text) {
+            Ok(decoded) => {
+                for d in decoded {
+                    self.on_decoded(d, recv_us, &mut out);
+                }
+            }
             Err(e) => {
                 // A lost seq-bearing frame shows up as a gap on the next frame.
                 self.stats.decode_errors += 1;
                 tracing::warn!(conn = self.conn, error = %format!("{e:#}"), "undecodable frame");
-                return out;
             }
-        };
+        }
+        out
+    }
+
+    fn on_decoded(&mut self, d: Decoded, recv_us: i64, out: &mut Vec<Action>) {
         if let Some((sid, seq)) = d.sid_seq() {
             let expected = self.next_seq.insert(sid, seq + 1);
             if let Some(expected) = expected.filter(|&e| e != seq) {
@@ -260,47 +226,40 @@ impl ConnState {
                     seq,
                     "seq gap; resyncing sid"
                 );
-                self.invalidate_sid(sid, recv_us, &mut out);
+                self.invalidate_sid(sid, recv_us, out);
             }
         }
         match d {
             Decoded::Snapshot {
-                sid,
-                id,
-                ticker,
+                sid_seq,
+                requested,
+                market,
                 bids,
                 asks,
-                sending_ts_ms,
-                ..
+                exch_us,
             } => {
-                let Some(m) = self.markets.get_mut(&ticker) else {
-                    return out;
+                let Some(m) = self.markets.get_mut(&market) else {
+                    return;
                 };
-                if id.is_some() && !m.streaming {
-                    // Not a base for deltas until its subscription snapshot arrives.
+                if requested && !m.streaming {
+                    // Not a base for level updates until its subscription snapshot arrives.
                     self.stats.early_snapshots += 1;
-                    return out;
+                    return;
                 }
                 self.stats.snapshots += 1;
-                let cause = match (m.streaming, id) {
+                let cause = match (m.streaming, requested) {
                     (false, _) => SnapCause::Subscribed,
-                    (true, Some(_)) => SnapCause::Resync,
-                    (true, None) => SnapCause::Exchange,
+                    (true, true) => SnapCause::Resync,
+                    (true, false) => SnapCause::Exchange,
                 };
                 m.streaming = true;
-                m.sid = Some(sid);
+                m.sid = sid_seq.map(|(sid, _)| sid);
                 match OrderBook::from_levels(&bids, &asks) {
                     Ok(book) => {
                         m.book = Some(book.clone());
                         m.resync_since = None;
-                        let exch_us = match sending_ts_ms {
-                            Some(ms) => ms * 1000,
-                            None => {
-                                self.stats.exch_ts_fallbacks += 1;
-                                recv_us
-                            }
-                        };
-                        let (conn, market) = (self.conn, ticker);
+                        let exch_us = self.exch_or_fallback(exch_us, recv_us);
+                        let conn = self.conn;
                         out.push(Action::Event(ConnEvent::Snapshot {
                             conn,
                             market,
@@ -311,42 +270,46 @@ impl ConnState {
                         }));
                     }
                     Err(e) => {
-                        tracing::warn!(conn = self.conn, %ticker, error = %e, "bad snapshot");
-                        let was_valid = m.book.take().is_some();
-                        self.resync(sid, vec![ticker], was_valid, recv_us, &mut out);
+                        tracing::warn!(conn = self.conn, %market, error = %e, "bad snapshot");
+                        let report = m.book.take().is_some();
+                        let sid = m.sid;
+                        self.resync(sid, vec![market], report, recv_us, out);
                     }
                 }
             }
-            Decoded::Delta {
-                ticker,
+            Decoded::Level {
+                market,
                 side,
                 price,
-                delta,
-                ts_ms,
-                sending_ts_ms,
+                change,
+                exch_us,
                 ..
             } => {
                 self.stats.deltas += 1;
-                let Some(m) = self.markets.get_mut(&ticker) else {
-                    return out;
+                let Some(m) = self.markets.get_mut(&market) else {
+                    return;
                 };
                 let Some(book) = m.book.as_mut() else {
                     self.stats.dropped_invalid += 1;
-                    return out;
+                    return;
                 };
-                match book.apply_delta(side, price, delta) {
+                let applied = match change {
+                    Change::Delta(delta) => book.apply_delta(side, price, delta),
+                    Change::Absolute(qty) if qty >= 0 => {
+                        book.set_level(side, price, qty);
+                        Ok(qty)
+                    }
+                    Change::Absolute(qty) => {
+                        Err(crate::book::BookError::BadQuantity { price, qty })
+                    }
+                };
+                match applied {
                     Ok(qty) => {
                         if book.is_crossed() {
                             self.stats.crossed += 1;
                         }
-                        let exch_us = match ts_ms.or(sending_ts_ms) {
-                            Some(ms) => ms * 1000,
-                            None => {
-                                self.stats.exch_ts_fallbacks += 1;
-                                recv_us
-                            }
-                        };
-                        let (conn, market) = (self.conn, ticker);
+                        let exch_us = self.exch_or_fallback(exch_us, recv_us);
+                        let conn = self.conn;
                         out.push(Action::Event(ConnEvent::Update {
                             conn,
                             market,
@@ -359,37 +322,38 @@ impl ConnState {
                     }
                     Err(e) => {
                         self.stats.bad_deltas += 1;
-                        tracing::warn!(conn = self.conn, %ticker, error = %e, "bad delta; resyncing market");
+                        tracing::warn!(conn = self.conn, %market, error = %e, "bad level update; resyncing market");
                         m.book = None;
-                        let sid = m.sid.expect("a valid book has a sid");
-                        self.resync(sid, vec![ticker], true, recv_us, &mut out);
+                        let sid = m.sid;
+                        self.resync(sid, vec![market], true, recv_us, out);
                     }
                 }
             }
-            Decoded::Lifecycle { ticker, event, .. } => {
+            Decoded::Lifecycle { market, event, .. } => {
                 let conn = self.conn;
                 out.push(Action::Event(ConnEvent::Lifecycle {
                     conn,
-                    market: ticker,
+                    market,
                     event,
                 }));
             }
-            Decoded::Error { id, code, msg } => {
+            Decoded::Error { code, msg } => {
                 *self.stats.errors.entry(code).or_default() += 1;
-                tracing::warn!(conn = self.conn, ?id, code, %msg, "kalshi error");
+                tracing::warn!(conn = self.conn, code, %msg, "venue error");
             }
-            Decoded::Subscribed { channel, sid, .. } => {
-                if channel == "orderbook_delta" {
-                    self.ob_sid = Some(sid);
-                }
-            }
-            Decoded::Ok { .. } | Decoded::Unsubscribed { .. } | Decoded::Other { .. } => {}
+            Decoded::Other { .. } => {}
         }
-        out
     }
 
-    /// A gap on `sid`: every market on it is invalid; streaming ones get a `get_snapshot`,
-    /// the rest are still waiting for their subscription snapshot anyway.
+    fn exch_or_fallback(&mut self, exch_us: Option<i64>, recv_us: i64) -> i64 {
+        exch_us.unwrap_or_else(|| {
+            self.stats.exch_ts_fallbacks += 1;
+            recv_us
+        })
+    }
+
+    /// A gap on `sid`: every market on it is invalid; streaming ones are resynced, the
+    /// rest are still waiting for their subscription snapshot anyway.
     fn invalidate_sid(&mut self, sid: u64, recv_us: i64, out: &mut Vec<Action>) {
         let mut tickers = Vec::new();
         for (ticker, m) in &mut self.markets {
@@ -404,37 +368,46 @@ impl ConnState {
             }
         }
         tickers.sort();
-        self.resync(sid, tickers, false, recv_us, out);
+        self.resync(Some(sid), tickers, false, recv_us, out);
     }
 
-    /// Request fresh snapshots for `tickers` on `sid`. `report` emits `Invalidated` first.
+    /// Fresh books for `tickers`: a snapshot request where the venue supports one,
+    /// otherwise a resubscribe. `report` emits `Invalidated` first.
     fn resync(
         &mut self,
-        sid: u64,
+        sid: Option<u64>,
         tickers: Vec<String>,
         report: bool,
         recv_us: i64,
         out: &mut Vec<Action>,
     ) {
-        for t in &tickers {
-            if report {
+        if tickers.is_empty() {
+            return;
+        }
+        if report {
+            for t in &tickers {
                 out.push(Action::Event(ConnEvent::Invalidated {
                     conn: self.conn,
                     market: t.clone(),
                 }));
             }
-            if let Some(m) = self.markets.get_mut(t) {
-                m.resync_since.get_or_insert(recv_us);
-            }
         }
-        for chunk in tickers.chunks(BATCH) {
-            self.next_id += 1;
-            self.stats.resync_requests += 1;
-            out.push(Action::Send(
-                json!({"id": self.next_id, "cmd": "update_subscription",
-                    "params": {"sids": [sid], "market_tickers": chunk, "action": "get_snapshot"}})
-                .to_string(),
-            ));
+        match sid.and_then(|sid| self.session.request_snapshots(sid, &tickers)) {
+            Some(cmds) => {
+                for t in &tickers {
+                    if let Some(m) = self.markets.get_mut(t) {
+                        m.resync_since.get_or_insert(recv_us);
+                    }
+                }
+                self.stats.resync_requests += cmds.len() as u64;
+                out.extend(cmds.into_iter().map(Action::Send));
+            }
+            // Already reported above; resubscribe would report again.
+            None => out.extend(
+                self.resubscribe(tickers)
+                    .into_iter()
+                    .filter(|a| matches!(a, Action::Send(_))),
+            ),
         }
     }
 }
@@ -465,9 +438,9 @@ impl ConnState {
 /// How to start a connection task.
 pub struct Spec {
     pub conn: ConnId,
-    /// Websocket URL (Kalshi's, or a local fault proxy's).
-    pub ws_url: String,
-    pub signer: Arc<Signer>,
+    pub exchange: Arc<dyn Exchange>,
+    /// Websocket URL override (e.g. a local fault proxy).
+    pub ws_url: Option<String>,
     pub tickers: Vec<String>,
     pub lifecycle: bool,
 }
@@ -481,15 +454,20 @@ pub async fn run(
 ) -> ConnStats {
     let Spec {
         conn,
+        exchange,
         ws_url,
-        signer,
         tickers,
         lifecycle,
     } = spec;
-    let mut st = ConnState::new(conn, &tickers, lifecycle);
+    let mut st = ConnState::new(conn, &tickers, exchange.session(lifecycle));
     let mut backoff = Duration::from_secs(1);
     while !*stop.borrow() {
-        let mut ws = match connect(&ws_url, &signer).await {
+        let request = exchange.ws_request(ws_url.as_deref());
+        let connected = match request {
+            Ok(req) => connect(req).await,
+            Err(e) => Err(e),
+        };
+        let mut ws = match connected {
             Ok(ws) => ws,
             Err(e) => {
                 // ponytail: jitter from the clock's low bits; add `rand` if it ever matters.
@@ -553,13 +531,13 @@ pub async fn run(
                         tracing::warn!(conn, "resync overdue; reconnecting");
                         ok = false;
                     } else {
-                        // Keeps idle sockets producing pongs, so silence means dead.
-                        ok &= ws.send(Message::Ping(Vec::new().into())).await.is_ok();
+                        // Keeps idle sockets producing replies, so silence means dead.
+                        ok &= ws.send(st.keepalive()).await.is_ok();
                     }
                 }
                 Some(cmd) = cmds.recv() => {
                     if matches!(cmd, ConnCmd::Drop) {
-                        tracing::warn!(conn, "dropping socket (test hook)");
+                        tracing::warn!(conn, "dropping socket (recycle or test hook)");
                         ok = false;
                     }
                     for a in st.apply(cmd) {
@@ -587,150 +565,7 @@ pub async fn run(
 pub type Ws =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
-/// Open a websocket with Kalshi's signed handshake headers.
-pub async fn connect(url: &str, signer: &Signer) -> anyhow::Result<Ws> {
-    let mut req = url.into_client_request()?;
-    for (name, value) in signer.headers("GET", WS_PATH) {
-        req.headers_mut()
-            .insert(name, HeaderValue::from_str(&value)?);
-    }
+pub async fn connect(req: Request) -> anyhow::Result<Ws> {
     let (ws, _) = tokio_tungstenite::connect_async(req).await?;
     Ok(ws)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::Side;
-
-    fn snap(seq: u64, id: Option<u64>, yes: &str) -> String {
-        let id = id.map(|i| format!(r#""id":{i},"#)).unwrap_or_default();
-        format!(
-            r#"{{"type":"orderbook_snapshot",{id}"sid":2,"seq":{seq},"msg":{{"market_ticker":"T","yes_dollars_fp":[{yes}]}},"sending_ts_ms":5}}"#
-        )
-    }
-    fn delta(seq: u64, d: &str) -> String {
-        format!(
-            r#"{{"type":"orderbook_delta","sid":2,"seq":{seq},"msg":{{"market_ticker":"T","price_dollars":"0.4000","delta_fp":"{d}","side":"yes","ts_ms":7}}}}"#
-        )
-    }
-    fn events(a: Vec<Action>) -> Vec<ConnEvent> {
-        a.into_iter()
-            .filter_map(|a| {
-                if let Action::Event(e) = a {
-                    Some(e)
-                } else {
-                    None
-                }
-            })
-            .collect()
-    }
-
-    #[test]
-    fn pending_until_subscription_snapshot_then_streams() {
-        let mut s = ConnState::new(0, &["T".into()], false);
-        s.subscribe_cmds();
-        assert!(s.on_frame(&delta(1, "5.00"), 10).is_empty()); // pending: dropped
-        assert_eq!(s.stats.dropped_invalid, 1);
-        assert!(
-            s.on_frame(&snap(2, Some(9), r#"["0.4000","1.00"]"#), 11)
-                .is_empty()
-        ); // early reply
-        let e = events(s.on_frame(&snap(3, None, r#"["0.4000","1.00"]"#), 12));
-        assert!(matches!(
-            e[0],
-            ConnEvent::Snapshot {
-                cause: SnapCause::Subscribed,
-                recv_us: 12,
-                exch_us: 5000,
-                ..
-            }
-        ));
-        let e = events(s.on_frame(&delta(4, "2.00"), 13));
-        assert_eq!(
-            e,
-            vec![ConnEvent::Update {
-                conn: 0,
-                market: "T".into(),
-                side: Side::Buy,
-                price: 400_000,
-                qty: 3_000_000,
-                recv_us: 13,
-                exch_us: 7000
-            }]
-        );
-    }
-
-    #[test]
-    fn gap_invalidates_and_requests_snapshot() {
-        let mut s = ConnState::new(0, &["T".into()], false);
-        s.subscribe_cmds();
-        s.on_frame(&snap(1, None, r#"["0.4000","1.00"]"#), 1);
-        let a = s.on_frame(&delta(3, "1.00"), 2); // seq 2 missing
-        assert_eq!(s.stats.seq_gaps, 1);
-        assert!(matches!(
-            &a[0],
-            Action::Event(ConnEvent::Invalidated { .. })
-        ));
-        assert!(
-            matches!(&a[1], Action::Send(c) if c.contains("get_snapshot") && c.contains("\"T\""))
-        );
-        assert_eq!(a.len(), 2); // the delta itself is dropped
-        let e = events(s.on_frame(&snap(4, Some(2), r#"["0.4000","9.00"]"#), 3));
-        assert!(matches!(
-            e[0],
-            ConnEvent::Snapshot {
-                cause: SnapCause::Resync,
-                ..
-            }
-        ));
-        assert!(!s.resync_overdue(i64::MAX));
-    }
-
-    #[test]
-    fn resubscribe_deletes_resubscribes_and_waits_for_a_fresh_snapshot() {
-        let mut s = ConnState::new(0, &["T".into()], false);
-        s.subscribe_cmds();
-        s.on_frame(
-            r#"{"type":"subscribed","id":1,"msg":{"channel":"orderbook_delta","sid":2}}"#,
-            0,
-        );
-        s.on_frame(&snap(1, None, r#"["0.4000","1.00"]"#), 1);
-        let a = s.resubscribe(vec!["T".into(), "UNKNOWN".into()]);
-        assert!(matches!(
-            &a[0],
-            Action::Event(ConnEvent::Invalidated { .. })
-        ));
-        assert!(
-            matches!(&a[1], Action::Send(c) if c.contains("delete_markets") && c.contains("\"T\""))
-        );
-        assert!(
-            matches!(&a[2], Action::Send(c) if c.contains("\"subscribe\"") && !c.contains("UNKNOWN"))
-        );
-        assert_eq!(a.len(), 3);
-        // Pending again: deltas dropped until the new subscription snapshot.
-        assert!(s.on_frame(&delta(2, "1.00"), 2).is_empty());
-        let e = events(s.on_frame(&snap(3, None, r#"["0.4000","4.00"]"#), 3));
-        assert!(matches!(
-            e[0],
-            ConnEvent::Snapshot {
-                cause: SnapCause::Subscribed,
-                ..
-            }
-        ));
-    }
-
-    #[test]
-    fn negative_delta_invalidates_market() {
-        let mut s = ConnState::new(0, &["T".into()], false);
-        s.subscribe_cmds();
-        s.on_frame(&snap(1, None, r#"["0.4000","1.00"]"#), 1);
-        let a = s.on_frame(&delta(2, "-2.00"), 2);
-        assert!(matches!(
-            &a[0],
-            Action::Event(ConnEvent::Invalidated { .. })
-        ));
-        assert!(matches!(&a[1], Action::Send(c) if c.contains("get_snapshot")));
-        assert!(s.resync_overdue(2 + RESYNC_TIMEOUT_US + 1));
-    }
 }
