@@ -160,10 +160,16 @@ pub async fn run(
 impl Control {
     async fn reconcile(&mut self, markets: Vec<MarketInfo>) {
         self.stats.discovery_passes += 1;
-        let live: HashSet<String> = markets.iter().map(|m| m.ticker.clone()).collect();
+        // The set removals are judged against: this pass if it lists every live market,
+        // else a finished complete listing, if the venue has one.
+        let live: Option<HashSet<String>> = if self.cfg.exchange.discovery_is_complete() {
+            Some(markets.iter().map(|m| m.ticker.clone()).collect())
+        } else {
+            self.cfg.exchange.live_markets(&reqwest::Client::new())
+        };
         let mut gone = Vec::new();
-        let complete = self.cfg.exchange.discovery_is_complete();
-        for m in self.planner.markets().filter(|_| complete) {
+        for m in self.planner.markets().filter(|_| live.is_some()) {
+            let live = live.as_ref().expect("filtered");
             if live.contains(m) {
                 self.misses.remove(m);
             } else {

@@ -104,6 +104,12 @@ pub trait Exchange: Send + Sync {
     fn discovery_is_complete(&self) -> bool {
         true
     }
+    /// For a venue whose [`Exchange::discover`] is capped: the complete set of live
+    /// tickers, when a (slow, background) complete listing has finished since the last
+    /// call. Markets missing from two of these are removed. `None`: nothing new.
+    fn live_markets(&self, _client: &reqwest::Client) -> Option<std::collections::HashSet<String>> {
+        None
+    }
     /// One discovery pass; an error means the pass failed.
     fn discover<'a>(
         &'a self,
@@ -168,12 +174,11 @@ impl VenueArgs {
                     .unwrap_or_else(|| self.env.rest().to_owned());
                 Arc::new(kalshi::Kalshi::new(self.env, signer, rest))
             }
-            Venue::Polymarket => Arc::new(polymarket::Polymarket {
-                gamma: self
-                    .rest_url
+            Venue::Polymarket => Arc::new(polymarket::Polymarket::new(
+                self.rest_url
                     .clone()
                     .unwrap_or_else(|| polymarket::GAMMA.to_owned()),
-            }),
+            )),
         })
     }
 }
