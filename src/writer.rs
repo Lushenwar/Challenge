@@ -13,7 +13,9 @@ use crate::{model::OutMsg, util::AlignedSbeWriter};
 // ponytail: output becomes visible in 64 MiB blocks; a time-based flush would cost up to
 // 64 MiB of padding each time.
 pub const CHUNK: usize = 64 << 20;
-const CAPACITY: usize = 100_000;
+/// Holds a whole minute-boundary burst (one snapshot per market, ~160k on Kalshi) so the
+/// arbiter, and through it the sockets, do not stall while the writer drains it.
+const CAPACITY: usize = 500_000;
 
 #[derive(Debug, Default, Clone, Serialize)]
 pub struct WriterStats {

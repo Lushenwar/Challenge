@@ -1,12 +1,12 @@
 //! Kalshi order-book collector: SBE deltas plus minute snapshots on stdout, logs and the
 //! final JSON report on stderr.
 
-use std::{io::Write, path::PathBuf, sync::Arc};
+use std::{io::Write, path::PathBuf, sync::Arc, time::Duration};
 
 use anyhow::Context;
 use clap::Parser;
 use engineering_challenge::{
-    arbiter, conn,
+    arbiter, control,
     exchange::kalshi::{Env, auth::Signer, discovery},
     model::now_us,
     writer,
@@ -23,9 +23,21 @@ struct Args {
     key_id: String,
     #[arg(long, env = "KALSHI_PRIVATE_KEY_PATH")]
     key_path: PathBuf,
-    /// Only collect the N most active markets (by 24h volume).
+    /// Only collect the N most active markets (by 24h volume). Default: all live markets.
     #[arg(long)]
     max_markets: Option<usize>,
+    /// Markets per websocket.
+    #[arg(long, default_value_t = 5000)]
+    markets_per_socket: usize,
+    /// Sockets each market is collected on (failover needs at least 2).
+    #[arg(long, default_value_t = 2)]
+    replicas: usize,
+    /// Test hook: drop socket N after S seconds, as `N@S`.
+    #[arg(long, value_parser = parse_drop)]
+    drop_conn: Option<(usize, Duration)>,
+    /// Seconds between the end of one discovery pass and the start of the next.
+    #[arg(long, default_value_t = 30)]
+    discovery_secs: u64,
     #[arg(long, default_value = "/dev/stdout")]
     output: PathBuf,
     /// Also write the final report here.
@@ -55,29 +67,26 @@ fn main() -> anyhow::Result<()> {
 async fn collect(args: Args) -> anyhow::Result<()> {
     let started_us = now_us();
     let signer = Arc::new(Signer::from_file(args.key_id.clone(), &args.key_path)?);
-    let mut markets = discovery::discover(&reqwest::Client::new(), args.env.rest())
+    let markets = discovery::discover(&reqwest::Client::new(), args.env.rest())
         .await
         .context("initial discovery")?;
     tracing::info!(markets = markets.len(), "discovered");
-    if let Some(n) = args.max_markets {
-        markets.sort_by_key(|m| std::cmp::Reverse(m.volume_24h));
-        markets.truncate(n);
-    }
-    let tickers: Vec<String> = markets.into_iter().map(|m| m.ticker).collect();
 
     let (out_tx, writer) = writer::spawn(args.output.clone())?;
     let (ev_tx, ev_rx) = mpsc::channel(100_000);
+    let (life_tx, life_rx) = mpsc::unbounded_channel();
     let (stop_tx, stop_rx) = watch::channel(false);
-    // ponytail: one socket for every market; Phase 5 shards across sockets.
-    let conn = tokio::spawn(conn::run(
-        0,
-        args.env,
+    let cfg = control::Config {
+        env: args.env,
         signer,
-        tickers.clone(),
-        ev_tx,
-        stop_rx,
-    ));
-    let arbiter = tokio::spawn(arbiter::run(ev_rx, out_tx));
+        markets_per_socket: args.markets_per_socket,
+        replicas: args.replicas,
+        drop_conn: args.drop_conn,
+        discovery_every: Duration::from_secs(args.discovery_secs),
+        max_markets: args.max_markets,
+    };
+    let control = tokio::spawn(control::run(cfg, markets, ev_tx, life_rx, stop_rx));
+    let arbiter = tokio::spawn(arbiter::run(ev_rx, out_tx, life_tx));
 
     shutdown_signal().await;
     tracing::info!("shutting down");
@@ -87,8 +96,8 @@ async fn collect(args: Args) -> anyhow::Result<()> {
         std::process::exit(130);
     });
     stop_tx.send(true)?;
-    let conn_stats = conn.await?;
-    let arbiter_stats = arbiter.await?; // ends once the connection dropped its sender
+    let (control_stats, conn_stats) = control.await?;
+    let arbiter_stats = arbiter.await?; // ends once every connection dropped its sender
     let writer_stats = tokio::task::spawn_blocking(move || writer.join())
         .await?
         .map_err(|_| anyhow::anyhow!("writer thread panicked"))??;
@@ -96,8 +105,8 @@ async fn collect(args: Args) -> anyhow::Result<()> {
     let report = json!({
         "run_start_us": started_us,
         "run_end_us": now_us(),
-        "markets_subscribed": tickers.len(),
-        "connections": [conn_stats],
+        "control": control_stats,
+        "connections": conn_stats,
         "arbiter": arbiter_stats,
         "writer": writer_stats,
     });
@@ -107,6 +116,14 @@ async fn collect(args: Args) -> anyhow::Result<()> {
         std::fs::write(path, text)?;
     }
     Ok(())
+}
+
+fn parse_drop(s: &str) -> Result<(usize, Duration), String> {
+    let (n, secs) = s.split_once('@').ok_or("expected N@SECONDS")?;
+    Ok((
+        n.parse().map_err(|e| format!("{e}"))?,
+        Duration::from_secs(secs.parse().map_err(|e| format!("{e}"))?),
+    ))
 }
 
 async fn shutdown_signal() {

@@ -2,10 +2,10 @@
 //! `verify` binary on the capture. A clean capture must verify; the same capture with one
 //! delta dropped must not.
 
-use std::{io::Write, path::Path, process::Command};
+use std::{collections::HashMap, io::Write, path::Path, process::Command};
 
 use engineering_challenge::{
-    arbiter::Arbiter,
+    arbiter::{Arbiter, ArbiterStats},
     conn::{Action, ConnState},
     model::{ConnEvent, OutMsg, SnapCause},
     util::AlignedSbeWriter,
@@ -28,65 +28,69 @@ struct Line {
     recv_us: Option<i64>,
 }
 
-/// Replays conn 0 of the fixture with minute boundaries injected from recorded time.
-/// Returns the output messages and the event log lines the collector would write.
-fn run_pipeline() -> (Vec<OutMsg>, String) {
+/// Replays the given recorded connections as replicas of the same markets, with minute
+/// boundaries injected from recorded time. Returns the output, the event log the
+/// collector would write, and the arbiter's stats.
+fn run_pipeline(conns: &[usize]) -> (Vec<OutMsg>, String, ArbiterStats) {
     let lines: Vec<Line> = std::fs::read_to_string(FIXTURE)
         .unwrap()
         .lines()
         .map(|l| serde_json::from_str(l).unwrap())
+        .filter(|l: &Line| conns.contains(&l.conn))
         .collect();
-    let mut tickers: Vec<String> = lines
+    let mut states: HashMap<usize, ConnState> = conns
         .iter()
-        .filter(|l| l.conn == 0)
-        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l.cmd.as_deref()?).ok())
-        .filter(|c| c["params"]["channels"][0] == "orderbook_delta")
-        .flat_map(|c| {
-            c["params"]["market_tickers"]
-                .as_array()
-                .cloned()
-                .unwrap_or_default()
+        .map(|&c| {
+            let mut tickers: Vec<String> = lines
+                .iter()
+                .filter(|l| l.conn == c)
+                .filter_map(|l| serde_json::from_str::<serde_json::Value>(l.cmd.as_deref()?).ok())
+                .filter(|cmd| cmd["params"]["channels"][0] == "orderbook_delta")
+                .flat_map(|cmd| {
+                    cmd["params"]["market_tickers"]
+                        .as_array()
+                        .cloned()
+                        .unwrap_or_default()
+                })
+                .filter_map(|t| t.as_str().map(String::from))
+                .collect();
+            tickers.sort();
+            tickers.dedup();
+            (c, ConnState::new(c, &tickers, false))
         })
-        .filter_map(|t| t.as_str().map(String::from))
         .collect();
-    tickers.sort();
-    tickers.dedup();
-
-    let mut conn = ConnState::new(0, &tickers);
     let mut arb = Arbiter::default();
     let (mut out, mut events) = (Vec::new(), String::new());
     let mut next_minute = None;
-    for l in lines.into_iter().filter(|l| l.conn == 0) {
+    for l in lines {
         let Some(recv_us) = l.recv_us else { continue };
         let boundary = *next_minute.get_or_insert((recv_us / MINUTE_US + 1) * MINUTE_US);
         if recv_us >= boundary {
             arb.snapshot_all(boundary, SnapCause::Periodic, &mut out);
             next_minute = Some(boundary + MINUTE_US);
         }
+        let st = states.get_mut(&l.conn).unwrap();
         if l.ctrl.as_deref() == Some("connected") {
-            arb.on_event(ConnEvent::Disconnected { conn: 0 }, &mut out);
-            conn.subscribe_cmds();
+            arb.on_event(ConnEvent::Disconnected { conn: l.conn }, &mut out);
+            st.subscribe_cmds();
         }
-        let Some(frame) = l.frame else { continue };
-        for a in conn.on_frame(&frame, recv_us) {
-            let Action::Event(e) = a else { continue };
-            if let ConnEvent::Snapshot {
-                market,
-                cause,
-                recv_us,
-                ..
-            } = &e
-            {
-                // Same shape as the collector's `snapshot` log line.
-                events += &format!(
-                    "INFO snapshot: snapshot market={market} cause={cause:?} recv_us={recv_us}\n"
-                );
+        if let Some(frame) = l.frame {
+            for a in st.on_frame(&frame, recv_us) {
+                if let Action::Event(e) = a {
+                    arb.on_event(e, &mut out);
+                }
             }
-            arb.on_event(e, &mut out);
+        }
+        for (market, cause, at) in arb.snapshot_log.drain(..) {
+            // Same shape as the collector's `snapshot` log line.
+            events += &format!(
+                "INFO snapshot: snapshot market={market} cause={cause:?} recv_us={at}
+"
+            );
         }
     }
-    assert_eq!(conn.stats.seq_gaps, 0);
-    (out, events)
+    assert!(states.values().all(|s| s.stats.seq_gaps == 0));
+    (out, events, arb.stats)
 }
 
 fn write_capture(msgs: &[OutMsg], path: &Path) {
@@ -123,7 +127,7 @@ fn verify(msgs: &[OutMsg], events: &str) -> (bool, serde_json::Value) {
 
 #[test]
 fn clean_capture_verifies() {
-    let (msgs, events) = run_pipeline();
+    let (msgs, events, _) = run_pipeline(&[0]);
     let (ok, summary) = verify(&msgs, &events);
     assert!(ok, "{summary:#}");
     assert_eq!(summary["messages"], msgs.len());
@@ -136,7 +140,7 @@ fn clean_capture_verifies() {
 
 #[test]
 fn dropped_delta_fails_verify() {
-    let (mut msgs, events) = run_pipeline();
+    let (mut msgs, events, _) = run_pipeline(&[0]);
     // Drop an update whose level is not touched again before its symbol's next snapshot,
     // and that next snapshot is periodic (so nothing in the event log explains it).
     let next_is_periodic = |i: usize| {
@@ -165,4 +169,22 @@ fn dropped_delta_fails_verify() {
         "verify accepted a capture with a dropped delta: {summary:#}"
     );
     assert!(summary["unexplained_mismatches"].as_u64().unwrap() >= 1);
+}
+
+/// Both recorded connections as replicas. The recording reconnected both sockets in the
+/// same second, so conn 0's drop fails over to conn 1 (snapshot, no gap), and conn 1's
+/// drop right after is a double fault: a real, positive gap until a source resubscribes.
+/// The capture must verify either way.
+#[test]
+fn replica_failover_and_double_fault_verify() {
+    let (msgs, events, stats) = run_pipeline(&[0, 1]);
+    assert!(stats.failovers > 0, "{stats:?}");
+    assert!(
+        stats.gaps <= stats.markets_seen && stats.gap_total_us > 0,
+        "{stats:?}"
+    );
+    assert!(events.contains("cause=Failover"));
+    let (ok, summary) = verify(&msgs, &events);
+    assert!(ok, "{summary:#}");
+    assert_eq!(summary["timestamp_regressions"], 0, "{summary:#}");
 }

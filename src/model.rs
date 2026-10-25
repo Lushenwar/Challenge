@@ -30,6 +30,10 @@ pub enum SnapCause {
     Exchange,
     Periodic,
     Shutdown,
+    /// Terminal empty snapshot: the market stopped trading.
+    Removed,
+    /// The active source was lost; this is the new source's book.
+    Failover,
 }
 
 /// Facts a connection reports. It never decides what is written.
@@ -62,6 +66,9 @@ pub enum ConnEvent {
         market: String,
         event: Lifecycle,
     },
+    /// The connection stopped collecting `market` (control removed it). Comes after
+    /// every earlier event for that market on this connection.
+    Removed { conn: ConnId, market: String },
 }
 
 #[derive(Debug, PartialEq)]

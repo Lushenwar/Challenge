@@ -83,6 +83,8 @@ fn main() -> anyhow::Result<()> {
     let mut r = AlignedSbeReader::<OrderbookSchema>::open(&args.capture)?;
     let mut symbols: HashMap<String, Symbol> = HashMap::new();
     let mut messages = 0u64;
+    // First few problems, for diagnosis: (kind, symbol, previous_us, this_us).
+    let mut examples: Vec<(&str, String, i64, i64)> = Vec::new();
     while let Some(msg) = r.read_msg()? {
         messages += 1;
         match msg {
@@ -111,17 +113,25 @@ fn main() -> anyhow::Result<()> {
                     st.max_interval_us = st.max_interval_us.max(at - prev);
                     if at - prev > MAX_SNAPSHOT_INTERVAL_US {
                         st.interval_violations += 1;
+                        if examples.len() < 10 {
+                            examples.push(("interval", s.symbol.clone(), prev, at));
+                        }
                     }
                 }
                 st.last_snapshot_us = Some(at);
                 st.book = Some(snap);
-                check_ts(st, at);
+                if check_ts(st, at) && examples.len() < 10 {
+                    examples.push(("regression_snapshot", s.symbol.clone(), st.last_ts, at));
+                }
             }
             AnyMessage::PriceLevelUpdate(u) => {
                 let u = PriceLevelUpdateDomain::try_from_decoder(u)?;
                 let st = symbols.entry(u.symbol.clone()).or_default();
                 st.updates += 1;
-                check_ts(st, u.backtest_timestamp.timestamp_micros());
+                let at = u.backtest_timestamp.timestamp_micros();
+                if check_ts(st, at) && examples.len() < 10 {
+                    examples.push(("regression_update", u.symbol.clone(), st.last_ts, at));
+                }
                 let Some(book) = st.book.as_mut() else {
                     st.updates_before_snapshot += 1;
                     continue;
@@ -155,6 +165,7 @@ fn main() -> anyhow::Result<()> {
         "max_snapshot_interval_us": symbols.values().map(|s| s.max_interval_us).max(),
         "timestamp_regressions": sum(|s| s.timestamp_regressions),
         "events_loaded": events.len(),
+        "examples": examples,
         "per_symbol": symbols.iter().collect::<BTreeMap<_, _>>(),
     });
     writeln!(
@@ -165,9 +176,12 @@ fn main() -> anyhow::Result<()> {
     std::process::exit(if unexplained == 0 { 0 } else { 1 });
 }
 
-fn check_ts(st: &mut Symbol, ts: i64) {
-    if ts < st.last_ts {
+/// Records `ts`; true if it went back in time for this symbol.
+fn check_ts(st: &mut Symbol, ts: i64) -> bool {
+    let back = ts < st.last_ts;
+    if back {
         st.timestamp_regressions += 1;
     }
     st.last_ts = st.last_ts.max(ts);
+    back
 }

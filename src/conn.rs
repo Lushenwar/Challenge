@@ -33,6 +33,10 @@ const BATCH: usize = 1000;
 /// broken: reconnect.
 const RESYNC_TIMEOUT_US: i64 = 15_000_000;
 const PING_EVERY: Duration = Duration::from_secs(10);
+/// No frame of any kind (data, ping, pong) for this long = a dead socket. Not "no pong
+/// within 10s": a pong queues behind bulk data (a socket's initial snapshots can take
+/// 15s+ to download), so a pong deadline falsely kills busy sockets.
+const SILENT_FOR: Duration = Duration::from_secs(20);
 
 #[derive(Debug, Default, Clone, Serialize)]
 pub struct ConnStats {
@@ -75,11 +79,16 @@ pub struct ConnState {
     markets: HashMap<String, Market>,
     next_seq: HashMap<u64, u64>,
     next_id: u64,
+    /// Also subscribe to `market_lifecycle_v2` (all markets) on this connection.
+    lifecycle: bool,
+    connected: bool,
+    /// The order-book subscription's sid (one per connection: subscribes merge).
+    ob_sid: Option<u64>,
     pub stats: ConnStats,
 }
 
 impl ConnState {
-    pub fn new(conn: ConnId, tickers: &[String]) -> Self {
+    pub fn new(conn: ConnId, tickers: &[String], lifecycle: bool) -> Self {
         Self {
             conn,
             markets: tickers
@@ -88,6 +97,9 @@ impl ConnState {
                 .collect(),
             next_seq: HashMap::new(),
             next_id: 0,
+            lifecycle,
+            connected: false,
+            ob_sid: None,
             stats: ConnStats::default(),
         }
     }
@@ -95,17 +107,33 @@ impl ConnState {
     /// Commands for a fresh connection. Every market becomes Pending.
     pub fn subscribe_cmds(&mut self) -> Vec<String> {
         self.next_seq.clear();
+        self.ob_sid = None;
+        self.connected = true;
         self.markets
             .values_mut()
             .for_each(|m| *m = Market::default());
-        let mut tickers: Vec<&String> = self.markets.keys().collect();
+        let mut tickers: Vec<String> = self.markets.keys().cloned().collect();
         tickers.sort();
-        let chunks: Vec<Vec<String>> = tickers
+        let mut cmds = Vec::new();
+        if self.lifecycle {
+            self.next_id += 1;
+            cmds.push(
+                json!({"id": self.next_id, "cmd": "subscribe",
+                    "params": {"channels": ["market_lifecycle_v2"]}})
+                .to_string(),
+            );
+        }
+        cmds.extend(self.orderbook_subscribe(&tickers));
+        cmds
+    }
+
+    pub fn disconnected(&mut self) {
+        self.connected = false;
+    }
+
+    fn orderbook_subscribe(&mut self, tickers: &[String]) -> Vec<String> {
+        tickers
             .chunks(BATCH)
-            .map(|c| c.iter().map(|t| t.to_string()).collect())
-            .collect();
-        chunks
-            .into_iter()
             .map(|chunk| {
                 self.next_id += 1;
                 json!({"id": self.next_id, "cmd": "subscribe",
@@ -113,6 +141,55 @@ impl ConnState {
                 .to_string()
             })
             .collect()
+    }
+
+    /// Start collecting `tickers`. Returns the commands to send now (none while
+    /// disconnected: the next connect subscribes everything).
+    pub fn add_markets(&mut self, tickers: Vec<String>) -> Vec<String> {
+        let new: Vec<String> = tickers
+            .into_iter()
+            .filter(|t| !self.markets.contains_key(t))
+            .collect();
+        for t in &new {
+            self.markets.insert(t.clone(), Market::default());
+        }
+        if self.connected {
+            self.orderbook_subscribe(&new)
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Stop collecting `tickers`: a `Removed` event per market (in order with every
+    /// earlier event) and a `delete_markets` command.
+    pub fn remove_markets(&mut self, tickers: &[String]) -> Vec<Action> {
+        let gone: Vec<String> = tickers
+            .iter()
+            .filter(|t| self.markets.remove(*t).is_some())
+            .cloned()
+            .collect();
+        let mut out: Vec<Action> = gone
+            .iter()
+            .map(|m| {
+                Action::Event(ConnEvent::Removed {
+                    conn: self.conn,
+                    market: m.clone(),
+                })
+            })
+            .collect();
+        // ponytail: before the sid is known the delete is skipped; frames for an unknown
+        // market are ignored anyway, and the next reconnect will not subscribe it.
+        if let (true, Some(sid)) = (self.connected, self.ob_sid) {
+            for chunk in gone.chunks(BATCH) {
+                self.next_id += 1;
+                out.push(Action::Send(
+                    json!({"id": self.next_id, "cmd": "update_subscription",
+                        "params": {"sids": [sid], "market_tickers": chunk, "action": "delete_markets"}})
+                    .to_string(),
+                ));
+            }
+        }
+        out
     }
 
     /// True if a requested resync is overdue and the connection should be recycled.
@@ -264,10 +341,12 @@ impl ConnState {
                 *self.stats.errors.entry(code).or_default() += 1;
                 tracing::warn!(conn = self.conn, ?id, code, %msg, "kalshi error");
             }
-            Decoded::Subscribed { .. }
-            | Decoded::Ok { .. }
-            | Decoded::Unsubscribed { .. }
-            | Decoded::Other { .. } => {}
+            Decoded::Subscribed { channel, sid, .. } => {
+                if channel == "orderbook_delta" {
+                    self.ob_sid = Some(sid);
+                }
+            }
+            Decoded::Ok { .. } | Decoded::Unsubscribed { .. } | Decoded::Other { .. } => {}
         }
         out
     }
@@ -323,16 +402,49 @@ impl ConnState {
     }
 }
 
+/// Changes to a connection's market set, from the control task.
+#[derive(Debug)]
+pub enum ConnCmd {
+    Add(Vec<String>),
+    Remove(Vec<String>),
+    /// Test hook: drop the socket now (it reconnects as after any failure).
+    Drop,
+}
+
+impl ConnState {
+    fn apply(&mut self, cmd: ConnCmd) -> Vec<Action> {
+        match cmd {
+            ConnCmd::Add(t) => self.add_markets(t).into_iter().map(Action::Send).collect(),
+            ConnCmd::Remove(t) => self.remove_markets(&t),
+            ConnCmd::Drop => Vec::new(),
+        }
+    }
+}
+
+/// How to start a connection task.
+pub struct Spec {
+    pub conn: ConnId,
+    pub env: Env,
+    pub signer: Arc<Signer>,
+    pub tickers: Vec<String>,
+    pub lifecycle: bool,
+}
+
 /// The socket loop. Returns when `stop` flips, after sending a close frame.
 pub async fn run(
-    conn: ConnId,
-    env: Env,
-    signer: Arc<Signer>,
-    tickers: Vec<String>,
+    spec: Spec,
+    mut cmds: mpsc::UnboundedReceiver<ConnCmd>,
     events: mpsc::Sender<ConnEvent>,
     mut stop: watch::Receiver<bool>,
 ) -> ConnStats {
-    let mut st = ConnState::new(conn, &tickers);
+    let Spec {
+        conn,
+        env,
+        signer,
+        tickers,
+        lifecycle,
+    } = spec;
+    let mut st = ConnState::new(conn, &tickers, lifecycle);
     let mut backoff = Duration::from_secs(1);
     while !*stop.borrow() {
         let mut ws = match connect(env, &signer).await {
@@ -341,9 +453,20 @@ pub async fn run(
                 // ponytail: jitter from the clock's low bits; add `rand` if it ever matters.
                 let jitter = Duration::from_millis((now_us() % 1000) as u64);
                 tracing::warn!(conn, error = %format!("{e:#}"), ?backoff, "connect failed");
-                tokio::select! {
-                    _ = tokio::time::sleep(backoff + jitter) => {}
-                    _ = stop.changed() => break,
+                let sleep = tokio::time::sleep(backoff + jitter);
+                tokio::pin!(sleep);
+                loop {
+                    tokio::select! {
+                        _ = &mut sleep => break,
+                        _ = stop.changed() => return st.stats,
+                        Some(cmd) = cmds.recv() => {
+                            for a in st.apply(cmd) {
+                                if let Action::Event(e) = a {
+                                    if events.send(e).await.is_err() { return st.stats }
+                                }
+                            }
+                        }
+                    }
                 }
                 backoff = (backoff * 2).min(Duration::from_secs(30));
                 continue;
@@ -351,17 +474,19 @@ pub async fn run(
         };
         backoff = Duration::from_secs(1);
         st.stats.connects += 1;
-        tracing::info!(conn, markets = tickers.len(), "connected");
+        tracing::info!(conn, markets = st.markets.len(), "connected");
         let mut ok = true;
         for cmd in st.subscribe_cmds() {
             ok &= ws.send(Message::text(cmd)).await.is_ok();
         }
         let mut ping = tokio::time::interval(PING_EVERY);
-        let mut awaiting_pong = false;
+        let mut last_rx = tokio::time::Instant::now();
         while ok {
             tokio::select! {
+                biased; // drain the socket before timers decide anything
                 msg = ws.next() => {
                     let recv_us = now_us(); // before any decoding
+                    last_rx = tokio::time::Instant::now();
                     match msg {
                         Some(Ok(Message::Text(t))) => {
                             for a in st.on_frame(t.as_str(), recv_us) {
@@ -371,7 +496,6 @@ pub async fn run(
                                 }
                             }
                         }
-                        Some(Ok(Message::Pong(_))) => awaiting_pong = false,
                         Some(Ok(Message::Close(c))) => { tracing::warn!(conn, ?c, "server closed"); ok = false }
                         Some(Ok(_)) => {}
                         Some(Err(e)) => { tracing::warn!(conn, error = %e, "read error"); ok = false }
@@ -379,16 +503,28 @@ pub async fn run(
                     }
                 }
                 _ = ping.tick() => {
-                    if awaiting_pong {
+                    if last_rx.elapsed() > SILENT_FOR {
                         st.stats.stalls += 1;
-                        tracing::warn!(conn, "no pong within {PING_EVERY:?}; reconnecting");
+                        tracing::warn!(conn, "nothing received for {SILENT_FOR:?}; reconnecting");
                         ok = false;
                     } else if st.resync_overdue(now_us()) {
                         tracing::warn!(conn, "resync overdue; reconnecting");
                         ok = false;
                     } else {
-                        awaiting_pong = true;
+                        // Keeps idle sockets producing pongs, so silence means dead.
                         ok &= ws.send(Message::Ping(Vec::new().into())).await.is_ok();
+                    }
+                }
+                Some(cmd) = cmds.recv() => {
+                    if matches!(cmd, ConnCmd::Drop) {
+                        tracing::warn!(conn, "dropping socket (test hook)");
+                        ok = false;
+                    }
+                    for a in st.apply(cmd) {
+                        match a {
+                            Action::Event(e) => if events.send(e).await.is_err() { return st.stats },
+                            Action::Send(c) => ok &= ws.send(Message::text(c)).await.is_ok(),
+                        }
                     }
                 }
                 _ = stop.changed() => {
@@ -398,6 +534,7 @@ pub async fn run(
                 }
             }
         }
+        st.disconnected();
         if events.send(ConnEvent::Disconnected { conn }).await.is_err() {
             break;
         }
@@ -448,7 +585,7 @@ mod tests {
 
     #[test]
     fn pending_until_subscription_snapshot_then_streams() {
-        let mut s = ConnState::new(0, &["T".into()]);
+        let mut s = ConnState::new(0, &["T".into()], false);
         s.subscribe_cmds();
         assert!(s.on_frame(&delta(1, "5.00"), 10).is_empty()); // pending: dropped
         assert_eq!(s.stats.dropped_invalid, 1);
@@ -483,7 +620,7 @@ mod tests {
 
     #[test]
     fn gap_invalidates_and_requests_snapshot() {
-        let mut s = ConnState::new(0, &["T".into()]);
+        let mut s = ConnState::new(0, &["T".into()], false);
         s.subscribe_cmds();
         s.on_frame(&snap(1, None, r#"["0.4000","1.00"]"#), 1);
         let a = s.on_frame(&delta(3, "1.00"), 2); // seq 2 missing
@@ -509,7 +646,7 @@ mod tests {
 
     #[test]
     fn negative_delta_invalidates_market() {
-        let mut s = ConnState::new(0, &["T".into()]);
+        let mut s = ConnState::new(0, &["T".into()], false);
         s.subscribe_cmds();
         s.on_frame(&snap(1, None, r#"["0.4000","1.00"]"#), 1);
         let a = s.on_frame(&delta(2, "-2.00"), 2);
