@@ -15,6 +15,9 @@ tempfile = "3"
 base64 = "0.22"
 clap = { version = "4", features = ["derive", "env"] }
 ed25519-dalek = { version = "2", features = ["pkcs8", "pem"] }
+rand = "0.8"
+rsa = { version = "0.9", features = ["sha2", "pem"] }
+sha2 = "0.10"
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-native-roots"] }
 serde_json = "1"

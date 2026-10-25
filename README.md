@@ -42,7 +42,8 @@ stable; the crate uses edition 2024).
 ```bash
 cargo build --release
 
-# Kalshi needs an API key (Ed25519, PKCS#8 PEM). Credentials come from the environment:
+# Kalshi needs an API key: Ed25519 (PKCS#8 PEM) or RSA (PKCS#8 or PKCS#1 PEM); the type
+# is detected from the file. Credentials come from the environment:
 export KALSHI_API_KEY_ID=<key id>
 export KALSHI_PRIVATE_KEY_PATH=~/.kalshi/key.pem
 
@@ -237,7 +238,6 @@ Things the docs do not say, found by recording prod traffic:
 - **Polymarket**: discovery covers the ~2,000 most active markets (Gamma refuses offsets
   past ~2,000; keyset paging is the upgrade path), so it never removes markets by
   discovery; Polymarket closes sockets that are not drained fast enough.
-- Ed25519 keys only (RSA-PSS signing is not implemented).
 - Bandwidth: all markets with 2 replicas is ~15 MB/s of websocket traffic.
 
 ## Repository layout
