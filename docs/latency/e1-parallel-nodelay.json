@@ -1,0 +1,60 @@
+{
+ "recording": "/home/ryann/rec/lat_e1.jsonl",
+ "matched_updates": 4611,
+ "connections": {
+  "c0-nodelay-lifecycle": {
+   "first_pct": 15.5,
+   "lag_us_p50": 679,
+   "lag_us_p90": 2752,
+   "lag_us_p99": 10429,
+   "exch_to_local_us_p50": 569129
+  },
+  "c1": {
+   "first_pct": 23.2,
+   "lag_us_p50": 72,
+   "lag_us_p90": 2396,
+   "lag_us_p99": 8634,
+   "exch_to_local_us_p50": 568621
+  },
+  "c2-nodelay": {
+   "first_pct": 27.5,
+   "lag_us_p50": 54,
+   "lag_us_p90": 2085,
+   "lag_us_p99": 9294,
+   "exch_to_local_us_p50": 568504
+  },
+  "c3": {
+   "first_pct": 33.7,
+   "lag_us_p50": 64,
+   "lag_us_p90": 2216,
+   "lag_us_p99": 5984,
+   "exch_to_local_us_p50": 568454
+  }
+ },
+ "rank_by_window": [
+  [
+   "c2-nodelay",
+   "c3",
+   "c1",
+   "c0-nodelay-lifecycle"
+  ],
+  [
+   "c2-nodelay",
+   "c3",
+   "c1",
+   "c0-nodelay-lifecycle"
+  ],
+  [
+   "c2-nodelay",
+   "c3",
+   "c1",
+   "c0-nodelay-lifecycle"
+  ],
+  [
+   "c2-nodelay",
+   "c3",
+   "c1",
+   "c0-nodelay-lifecycle"
+  ]
+ ]
+}

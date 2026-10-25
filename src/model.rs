@@ -36,6 +36,8 @@ pub enum SnapCause {
     Failover,
     /// The active source fell behind a replica for over 2s; this is the replica's book.
     Stale,
+    /// A replica has been consistently delivering the same updates first; this is its book.
+    Faster,
 }
 
 /// Facts a connection reports. It never decides what is written.

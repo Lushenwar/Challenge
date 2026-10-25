@@ -6,6 +6,7 @@
 
 use std::{
     io::Write,
+    net::{IpAddr, SocketAddr},
     path::PathBuf,
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -20,7 +21,7 @@ use engineering_challenge::{
 use futures_util::{SinkExt, StreamExt};
 use serde_json::json;
 use tokio::sync::{mpsc, watch};
-use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::tungstenite::{Message, handshake::client::Request};
 
 #[derive(Parser)]
 struct Args {
@@ -44,6 +45,17 @@ struct Args {
     /// supports it; replay tests compare them with books rebuilt from updates.
     #[arg(long)]
     snapshot_every: Option<u64>,
+    /// Latency lab: connection i uses `ws_urls[i % len]` (e.g. two hostnames of one
+    /// venue); default the venue's URL.
+    #[arg(long, value_delimiter = ',')]
+    ws_urls: Vec<String>,
+    /// Latency lab: connect connection i to `ips[i % len]` instead of DNS (TLS still
+    /// uses the hostname).
+    #[arg(long, value_delimiter = ',')]
+    ips: Vec<IpAddr>,
+    /// Latency lab: set TCP_NODELAY on these connections.
+    #[arg(long, value_delimiter = ',')]
+    nodelay_conns: Vec<usize>,
     #[arg(long)]
     out: PathBuf,
 }
@@ -100,8 +112,15 @@ async fn main() -> anyhow::Result<()> {
     let (stop_tx, stop_rx) = watch::channel(false);
     let mut tasks = Vec::new();
     for conn in 0..args.conns {
+        let ip = (!args.ips.is_empty()).then(|| args.ips[conn % args.ips.len()]);
+        let nodelay = args.nodelay_conns.contains(&conn);
+        let url =
+            (!args.ws_urls.is_empty()).then(|| args.ws_urls[conn % args.ws_urls.len()].clone());
         tasks.push(tokio::spawn(run_conn(
             conn,
+            ip,
+            nodelay,
+            url,
             exchange.clone(),
             tickers.clone(),
             args.reconnect_after.map(Duration::from_secs),
@@ -127,8 +146,37 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// TCP to `ip` (or the first DNS answer), optional TCP_NODELAY, then TLS + websocket.
+async fn open(
+    req: Request,
+    ip: Option<IpAddr>,
+    nodelay: bool,
+) -> anyhow::Result<(conn::Ws, SocketAddr)> {
+    let host = req
+        .uri()
+        .host()
+        .context("websocket URL has no host")?
+        .to_owned();
+    let port = req.uri().port_u16().unwrap_or(443);
+    let addr = match ip {
+        Some(ip) => SocketAddr::new(ip, port),
+        None => tokio::net::lookup_host((host.as_str(), port))
+            .await?
+            .next()
+            .context("no address")?,
+    };
+    let tcp = tokio::net::TcpStream::connect(addr).await?;
+    tcp.set_nodelay(nodelay)?;
+    let (ws, _) = tokio_tungstenite::client_async_tls(req, tcp).await?;
+    Ok((ws, addr))
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn run_conn(
     conn: usize,
+    ip: Option<IpAddr>,
+    nodelay: bool,
+    url: Option<String>,
     exchange: Arc<dyn Exchange>,
     tickers: Vec<String>,
     reconnect_after: Option<Duration>,
@@ -142,8 +190,8 @@ async fn run_conn(
     // Lifecycle (venue-wide) on conn 0 only: it is large and the same on every socket.
     let mut session = exchange.session(conn == 0);
     while !*stop.borrow() {
-        let mut ws = match conn::connect(exchange.ws_request(None)?).await {
-            Ok(ws) => ws,
+        let (mut ws, peer) = match open(exchange.ws_request(url.as_deref())?, ip, nodelay).await {
+            Ok(x) => x,
             Err(e) => {
                 tracing::warn!(conn, error = %e, ?backoff, "connect failed");
                 tokio::time::sleep(backoff).await;
@@ -152,9 +200,12 @@ async fn run_conn(
             }
         };
         backoff = Duration::from_secs(1);
-        let _ =
-            lines.send(json!({"conn": conn, "recv_us": now_us(), "ctrl": "connected"}).to_string());
-        tracing::info!(conn, "connected");
+        let peer = peer.to_string();
+        let _ = lines.send(
+            json!({"conn": conn, "recv_us": now_us(), "ctrl": "connected", "peer": peer, "nodelay": nodelay})
+                .to_string(),
+        );
+        tracing::info!(conn, %peer, nodelay, "connected");
         for text in session.on_connect(&tickers) {
             let _ = lines.send(json!({"conn": conn, "sent_us": now_us(), "cmd": text}).to_string());
             ws.send(Message::text(text)).await?;

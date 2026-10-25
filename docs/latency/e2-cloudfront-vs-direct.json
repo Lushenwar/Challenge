@@ -1,0 +1,71 @@
+{
+ "recording": "/home/ryann/rec/lat_e2.jsonl",
+ "matched_updates": 5576,
+ "connections": {
+  "c0-cloudfront-lifecycle": {
+   "first_pct": 37.0,
+   "lag_us_p50": 48,
+   "lag_us_p90": 2147,
+   "lag_us_p99": 8089,
+   "exch_to_local_us_p50": 595487
+  },
+  "c1-direct": {
+   "first_pct": 1.1,
+   "lag_us_p50": 5053,
+   "lag_us_p90": 7546,
+   "lag_us_p99": 19577,
+   "exch_to_local_us_p50": 600054
+  },
+  "c2-cloudfront": {
+   "first_pct": 14.0,
+   "lag_us_p50": 1891,
+   "lag_us_p90": 5997,
+   "lag_us_p99": 13686,
+   "exch_to_local_us_p50": 597012
+  },
+  "c3-direct": {
+   "first_pct": 1.6,
+   "lag_us_p50": 4046,
+   "lag_us_p90": 6542,
+   "lag_us_p99": 17646,
+   "exch_to_local_us_p50": 599220
+  },
+  "c4-cloudfront": {
+   "first_pct": 46.2,
+   "lag_us_p50": 27,
+   "lag_us_p90": 1949,
+   "lag_us_p99": 6852,
+   "exch_to_local_us_p50": 595229
+  }
+ },
+ "rank_by_window": [
+  [
+   "c4-cloudfront",
+   "c0-cloudfront-lifecycle",
+   "c2-cloudfront",
+   "c3-direct",
+   "c1-direct"
+  ],
+  [
+   "c4-cloudfront",
+   "c0-cloudfront-lifecycle",
+   "c2-cloudfront",
+   "c3-direct",
+   "c1-direct"
+  ],
+  [
+   "c4-cloudfront",
+   "c0-cloudfront-lifecycle",
+   "c2-cloudfront",
+   "c3-direct",
+   "c1-direct"
+  ],
+  [
+   "c4-cloudfront",
+   "c0-cloudfront-lifecycle",
+   "c2-cloudfront",
+   "c3-direct",
+   "c1-direct"
+  ]
+ ]
+}

@@ -40,6 +40,8 @@ pub struct ArbiterStats {
     pub resubscribes_lag: u64,
     pub resubscribes_rate: u64,
     pub recycles: u64,
+    /// Switches to a replica that was consistently first (latency lab finding).
+    pub switches_faster: u64,
 }
 
 #[derive(Default)]
@@ -57,6 +59,8 @@ struct Source {
     rate: Rate,
     /// Since when its book has been valid without interruption.
     valid_since: Option<i64>,
+    /// This minute: updates it applied before any other valid source had them.
+    first: u32,
 }
 
 #[derive(Default)]
@@ -179,6 +183,14 @@ impl Arbiter {
                 let Some(m) = self.markets.get_mut(&market) else {
                     return;
                 };
+                // First to deliver this update among the valid sources? (A tie in exchange
+                // time is not counted: the event was seen together.)
+                let others = m
+                    .sources
+                    .iter()
+                    .filter(|(c, s)| **c != conn && s.book.is_some())
+                    .map(|(_, s)| s.delta_us)
+                    .max();
                 let Some(src) = m.sources.get_mut(&conn) else {
                     return;
                 };
@@ -188,6 +200,9 @@ impl Arbiter {
                 book.set_level(side, price, qty);
                 src.exch_us = exch_us;
                 src.recv_us = recv_us;
+                if exch_us > src.delta_us && others.is_some_and(|o| exch_us > o) {
+                    src.first += 1;
+                }
                 src.delta_us = exch_us;
                 src.rate.hit();
                 if m.track_lag(recv_us) {
@@ -396,6 +411,52 @@ impl Arbiter {
             })
     }
 
+    /// Latency: once a minute, make a replica active if it has been consistently first.
+    pub fn prefer_faster(&mut self, out: &mut Vec<OutMsg>) {
+        let mut switch: Vec<(String, ConnId)> = Vec::new();
+        for (market, m) in &mut self.markets {
+            let Some(active) = m.active.filter(|_| !m.removed) else {
+                m.sources.values_mut().for_each(|s| s.first = 0);
+                continue;
+            };
+            let total: u32 = m.sources.values().map(|s| s.first).sum();
+            let a = &m.sources[&active];
+            let winner = m
+                .sources
+                .iter()
+                .filter(|(c, s)| **c != active && s.book.is_some() && s.delta_us >= a.delta_us)
+                .max_by_key(|(_, s)| s.first)
+                .filter(|(_, s)| {
+                    s.first >= health::FASTER_MIN_WINS
+                        && s.first * 100 >= total * health::FASTER_PCT
+                })
+                .map(|(c, _)| *c);
+            if let Some(c) = winner {
+                switch.push((market.clone(), c));
+            }
+            m.sources.values_mut().for_each(|s| s.first = 0);
+        }
+        switch.sort();
+        for (market, next) in switch {
+            let m = self.markets.get_mut(&market).expect("collected above");
+            m.active = Some(next);
+            let at = m.sources[&next].recv_us.max(m.last_out_us);
+            m.last_out_us = at;
+            let log = &mut self.snapshot_log;
+            emit(
+                &market,
+                m,
+                next,
+                at,
+                SnapCause::Faster,
+                out,
+                log,
+                &mut self.stats,
+            );
+            self.stats.switches_faster += 1;
+        }
+    }
+
     /// Health rule 2; call once per minute. Never resubscribes the active source while a
     /// valid replica exists: that would open a gap, and a silent active source is caught
     /// by rule 1 through its replica. With one replica, the only source is resubscribed.
@@ -540,6 +601,7 @@ pub async fn run(
                 let now = now_us();
                 a.snapshot_all(now, SnapCause::Periodic, &mut buf);
                 a.health_minute(now);
+                a.prefer_faster(&mut buf);
                 minute.as_mut().reset(tokio::time::Instant::now() + until_next_minute());
             }
             _ = tick.tick() => a.on_tick(now_us(), &mut buf),
@@ -806,6 +868,38 @@ mod tests {
         a.on_event(update(0, 7, 4_000), &mut out);
         a.on_tick(60_000_000, &mut out);
         assert_eq!(a.stats.failovers_stale, 0);
+    }
+
+    /// Latency finding: a replica that keeps delivering the same updates first becomes
+    /// the active source at the minute check; a replica that is first only sometimes
+    /// does not.
+    #[test]
+    fn a_consistently_faster_replica_becomes_active() {
+        let mut a = Arbiter::default();
+        let mut out = Vec::new();
+        a.on_event(snap(0, 400_000, 1), &mut out); // conn 0 active
+        a.on_event(snap(1, 400_000, 1), &mut out);
+        for i in 0..30 {
+            let t = 1_000 + i * 1_000;
+            a.on_event(update(1, i + 1, t), &mut out); // conn 1 first every time
+            a.on_event(update(0, i + 1, t), &mut out);
+        }
+        a.prefer_faster(&mut out);
+        assert_eq!(a.stats.switches_faster, 1);
+        assert_eq!(bids(out.last().unwrap()), vec![(400_000, 30)]);
+        // Now conn 1's updates are written, conn 0's are not.
+        let n = out.len();
+        a.on_event(update(0, 99, 50_000), &mut out);
+        assert_eq!(out.len(), n);
+        // Mixed leads the next minute: no switch back.
+        for i in 0..30 {
+            let t = 60_000 + i * 1_000;
+            let (first, second) = if i % 2 == 0 { (0, 1) } else { (1, 0) };
+            a.on_event(update(first, i + 1, t), &mut out);
+            a.on_event(update(second, i + 1, t), &mut out);
+        }
+        a.prefer_faster(&mut out);
+        assert_eq!(a.stats.switches_faster, 1);
     }
 
     /// Found in the chaos run: a socket-wide stall (every market on it at once) fails

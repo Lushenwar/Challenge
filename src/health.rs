@@ -17,6 +17,13 @@ pub const LAG_LIMIT_US: i64 = 2_000_000;
 pub const SOCKET_LAG_MARKETS: usize = 20;
 pub const SOCKET_LAG_WINDOW_US: i64 = 5_000_000;
 
+/// Latency lab finding: connections to the same venue differ by milliseconds, stably
+/// (`docs/latency.md`). Over one minute, a replica that applied at least this many
+/// contested updates first...
+pub const FASTER_MIN_WINS: u32 = 20;
+/// ...and at least this percent of all contested updates, becomes the active source.
+pub const FASTER_PCT: u32 = 80;
+
 /// Rule 2: a rate below this percent of the baseline is a collapse.
 const COLLAPSE_PCT: i64 = 10;
 /// Baseline floor (milli-messages per minute): quieter markets have no baseline.
