@@ -146,7 +146,7 @@ All runs on live Kalshi prod unless noted; every capture checked with `verify`.
 | 10 min, all markets, 2 replicas, one socket killed mid-run | 4,543 failovers, **0 gaps**; verify: 0 unexplained mismatches, 0 interval violations |
 | 2 hours through the fault proxy, 20,000 markets, a fault every ~2 min per socket (connection drops, single-frame drops, 3 s delays, silenced markets) | verify exit 0: 1.98M periodic snapshots checked, 0 unexplained mismatches, 0 interval violations. 152 dropped frames = 152 seq gaps detected; 61 dropped connections + 22 recycles = 83 reconnects. 1,673 gaps from overlapping faults on both replicas: median 0.1 s, max 1.6 s |
 | 30 min Polymarket, 4,170 books, 2 replicas | verify exit 0, 0 unexplained mismatches, 0 interval violations |
-| Final soak: 6 hours, all markets (175,165 seen), 2 replicas, 63 sockets | SIGINT exit 0; 736M deltas, **0 seq gaps**, 0 decode errors, 0 crossed books; 25,627 markets removed as they settled; 470 scheduled socket recycles; 2,000+ short gaps (98.8% under 5 s, longest ~29 s, around 6 Kalshi "subscription buffer overflow" errors) |
+| Final soak: 6 hours, all markets (175,165 seen), 2 replicas, 63 sockets | SIGINT exit 0; 736M deltas, **0 seq gaps**, 0 decode errors, 0 crossed books; 25,627 markets removed as they settled; 470 scheduled socket recycles; 2,000+ short gaps (98.8% under 5 s, longest ~29 s, around 6 Kalshi "subscription buffer overflow" errors). verify: exit 0, 411M messages, 52.9M periodic snapshots checked, 0 unexplained mismatches, 0 interval violations |
 
 The same fault rate on all ~157k markets saturated the test machine's 28 MB/s link (every
 fault re-downloads ~5,000 snapshots), so that run was cut to the 20,000 most active
