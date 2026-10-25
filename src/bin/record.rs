@@ -6,7 +6,7 @@
 
 use std::{
     io::Write,
-    net::{IpAddr, SocketAddr},
+    net::IpAddr,
     path::PathBuf,
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -15,13 +15,13 @@ use std::{
 use anyhow::Context;
 use clap::Parser;
 use engineering_challenge::{
-    conn,
     exchange::{self, Decoded, Exchange},
+    net,
 };
 use futures_util::{SinkExt, StreamExt};
 use serde_json::json;
 use tokio::sync::{mpsc, watch};
-use tokio_tungstenite::tungstenite::{Message, handshake::client::Request};
+use tokio_tungstenite::tungstenite::Message;
 
 #[derive(Parser)]
 struct Args {
@@ -146,31 +146,6 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// TCP to `ip` (or the first DNS answer), optional TCP_NODELAY, then TLS + websocket.
-async fn open(
-    req: Request,
-    ip: Option<IpAddr>,
-    nodelay: bool,
-) -> anyhow::Result<(conn::Ws, SocketAddr)> {
-    let host = req
-        .uri()
-        .host()
-        .context("websocket URL has no host")?
-        .to_owned();
-    let port = req.uri().port_u16().unwrap_or(443);
-    let addr = match ip {
-        Some(ip) => SocketAddr::new(ip, port),
-        None => tokio::net::lookup_host((host.as_str(), port))
-            .await?
-            .next()
-            .context("no address")?,
-    };
-    let tcp = tokio::net::TcpStream::connect(addr).await?;
-    tcp.set_nodelay(nodelay)?;
-    let (ws, _) = tokio_tungstenite::client_async_tls(req, tcp).await?;
-    Ok((ws, addr))
-}
-
 #[allow(clippy::too_many_arguments)]
 async fn run_conn(
     conn: usize,
@@ -190,7 +165,17 @@ async fn run_conn(
     // Lifecycle (venue-wide) on conn 0 only: it is large and the same on every socket.
     let mut session = exchange.session(conn == 0);
     while !*stop.borrow() {
-        let (mut ws, peer) = match open(exchange.ws_request(url.as_deref())?, ip, nodelay).await {
+        let (mut ws, peer) = match net::connect(
+            exchange.ws_request(url.as_deref())?,
+            &net::NetOpts {
+                nodelay,
+                ip,
+                ..Default::default()
+            },
+            conn,
+        )
+        .await
+        {
             Ok(x) => x,
             Err(e) => {
                 tracing::warn!(conn, error = %e, ?backoff, "connect failed");

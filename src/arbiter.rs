@@ -42,6 +42,8 @@ pub struct ArbiterStats {
     pub recycles: u64,
     /// Switches to a replica that was consistently first (latency lab finding).
     pub switches_faster: u64,
+    /// Per socket: updates it delivered before every other valid replica (latency).
+    pub first_by_conn: BTreeMap<ConnId, u64>,
 }
 
 #[derive(Default)]
@@ -202,6 +204,7 @@ impl Arbiter {
                 src.recv_us = recv_us;
                 if exch_us > src.delta_us && others.is_some_and(|o| exch_us > o) {
                     src.first += 1;
+                    *self.stats.first_by_conn.entry(conn).or_default() += 1;
                 }
                 src.delta_us = exch_us;
                 src.rate.hit();
@@ -886,6 +889,12 @@ mod tests {
         }
         a.prefer_faster(&mut out);
         assert_eq!(a.stats.switches_faster, 1);
+        assert_eq!(
+            a.stats.first_by_conn.get(&1),
+            Some(&30),
+            "conn 1 first 30 times"
+        );
+        assert_eq!(a.stats.first_by_conn.get(&0), None);
         assert_eq!(bids(out.last().unwrap()), vec![(400_000, 30)]);
         // Now conn 1's updates are written, conn 0's are not.
         let n = out.len();

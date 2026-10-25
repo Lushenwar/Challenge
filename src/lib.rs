@@ -11,5 +11,6 @@ pub mod exchange;
 pub mod fixed;
 pub mod health;
 pub mod model;
+pub mod net;
 pub mod planner;
 pub mod writer;

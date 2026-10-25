@@ -14,7 +14,7 @@ use std::{
 use futures_util::{SinkExt, StreamExt};
 use serde::Serialize;
 use tokio::sync::{mpsc, watch};
-use tokio_tungstenite::tungstenite::{Message, handshake::client::Request};
+use tokio_tungstenite::tungstenite::Message;
 
 use crate::{
     book::OrderBook,
@@ -443,6 +443,7 @@ pub struct Spec {
     pub ws_url: Option<String>,
     pub tickers: Vec<String>,
     pub lifecycle: bool,
+    pub net: crate::net::NetOpts,
 }
 
 /// The socket loop. Returns when `stop` flips, after sending a close frame.
@@ -458,13 +459,19 @@ pub async fn run(
         ws_url,
         tickers,
         lifecycle,
+        net,
     } = spec;
     let mut st = ConnState::new(conn, &tickers, exchange.session(lifecycle));
     let mut backoff = Duration::from_secs(1);
     while !*stop.borrow() {
         let request = exchange.ws_request(ws_url.as_deref());
         let connected = match request {
-            Ok(req) => connect(req).await,
+            Ok(req) => crate::net::connect(req, &net, conn)
+                .await
+                .map(|(ws, peer)| {
+                    tracing::debug!(conn, %peer, "tcp peer");
+                    ws
+                }),
             Err(e) => Err(e),
         };
         let mut ws = match connected {
@@ -560,12 +567,4 @@ pub async fn run(
         }
     }
     st.stats
-}
-
-pub type Ws =
-    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
-
-pub async fn connect(req: Request) -> anyhow::Result<Ws> {
-    let (ws, _) = tokio_tungstenite::connect_async(req).await?;
-    Ok(ws)
 }

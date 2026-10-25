@@ -1,0 +1,29 @@
+{
+ "experiment": "c3-race4",
+ "args": "--race 4",
+ "verify_exit": 0,
+ "updates_written": 3193052,
+ "unexplained": 0,
+ "receive_minus_exchange_us": {
+  "n": 3193052,
+  "p1": 2233000,
+  "p10": 2246800,
+  "p50": 2293400,
+  "p90": 2426400,
+  "p99": 3672100
+ },
+ "first_share_by_socket_pct": {
+  "0": 15.5,
+  "1": 12.4,
+  "2": 7.7,
+  "3": 15.7,
+  "4": 5.8,
+  "5": 16.5,
+  "6": 21.0,
+  "7": 5.4
+ },
+ "contested_updates": 2198236,
+ "switches_faster": 101,
+ "failovers": 1094,
+ "sockets": 8
+}

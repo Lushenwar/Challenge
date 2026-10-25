@@ -1,0 +1,29 @@
+{
+ "experiment": "c2-direct",
+ "args": "--ws-url wss://external-api-ws.kalshi.com/trade-api/ws/v2",
+ "verify_exit": 0,
+ "updates_written": 3112260,
+ "unexplained": 0,
+ "receive_minus_exchange_us": {
+  "n": 3112260,
+  "p1": 2212900,
+  "p10": 2219600,
+  "p50": 2246400,
+  "p90": 2370100,
+  "p99": 2618100
+ },
+ "first_share_by_socket_pct": {
+  "0": 15.3,
+  "1": 10.2,
+  "2": 10.9,
+  "3": 7.9,
+  "4": 16.9,
+  "5": 19.5,
+  "6": 14.3,
+  "7": 5.0
+ },
+ "contested_updates": 2185168,
+ "switches_faster": 187,
+ "failovers": 145,
+ "sockets": 8
+}

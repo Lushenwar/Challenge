@@ -86,8 +86,9 @@ chaos run).
 - An earlier hypothesis that carrying the venue-wide lifecycle feed slows a connection
   (E1's slowest connection carried it) did **not** hold: in E2 the lifecycle connection
   was the second fastest.
-- Not tried: source-port choice, connecting right after Kalshi's scheduled maintenance
-  (none happened during this session), and kernel receive timestamps (`SO_TIMESTAMPNS`).
+- Not measured: source-port choice (the collector supports it, see below; its run was
+  cut short), connecting right after Kalshi's scheduled maintenance (none happened during
+  this session), and kernel receive timestamps (`SO_TIMESTAMPNS`).
   The per-connection variance seen here (~1 ms) would have to be separated from those
   effects with the same matched-update method.
 
@@ -102,4 +103,41 @@ chaos run).
    `Faster`). With two replicas per market this picks the better connection of the pair:
    in E3 the spread between a market's two connections was typically ~1 ms at the median.
    Thresholds: `FASTER_MIN_WINS` and `FASTER_PCT` in `src/health.rs`.
-3. Pinning IPs and `TCP_NODELAY` are left out: no measurable benefit.
+3. Pinning IPs is left out: no measurable benefit. `TCP_NODELAY` is now set on every
+   collector socket anyway (it costs nothing and our pings/commands are tiny writes).
+
+## Through the collector (C1–C3)
+
+The collector itself now opens its sockets through `src/net.rs`: `TCP_NODELAY` always,
+`--race N` (N parallel TCP+TLS+websocket handshakes per connect, spread over the host's
+addresses; the first to finish is kept, the rest dropped), and `--source-port-base P`
+(pin each socket's local port, falling back to any port if it is taken). Unit tests on a
+local server cover all three.
+
+Each run: 10 min, the 2,000 most active markets, 2 replicas, 500 markets per socket
+(8 sockets), then `verify`. `verify` now reports `receive_minus_exchange_us` percentiles
+over every written update, and the report counts, per socket, the updates it delivered
+before every other valid replica (`first_by_conn`). Raw results:
+[`latency/collector-*.json`](latency/).
+
+| run | args | verify | p1 / p50 / p99 receive − exchange (ms) | first-share per socket (min–max) |
+|---|---|---|---|---|
+| C1 baseline (CloudFront) | — | exit 0, 2.77M updates | 2181.8 / 2203.3 / 4992.2 | 7.4–22.0% |
+| C2 direct host | `--ws-url wss://external-api-ws…` | exit 0, 3.11M | 2212.9 / 2246.4 / 2618.1 | 5.0–19.5% |
+| C3 race 4 | `--race 4` | exit 0, 3.19M | 2233.0 / 2293.4 / 3672.1 | 5.4–21.0% |
+| C4 source ports | `--source-port-base 41000` | run cut off after 3 min by memory pressure: no result | | |
+
+What this shows, and what it does not:
+- **Cross-run latency comparisons are not valid with this method.** The ~2.2 s offset is
+  mostly this machine's clock running behind Kalshi's, and it drifted between runs: the
+  median rose 2203 → 2246 → 2293 ms over ~35 min regardless of the setting (C2 was the
+  setting E2 already showed to be slower *within one recording*, by 4–5 ms; here the
+  drift is ~10× that). Absolute `ts_ms` latencies can only rank settings that run in the
+  same recording, as E1–E3 do.
+- Within each run, some sockets are first far more often than others (7–22%), but the
+  share also depends on how many busy markets each socket carries, so it is not a pure
+  speed ranking; the matched-update method of E1–E3 is the fair one.
+- Racing (C3) made no difference detectable here. A fair test of racing (and of source
+  ports) needs both settings in one recording: e.g. `record` with half the connections
+  racing. Not done.
+- Correctness was unaffected: all three captures verify with 0 unexplained mismatches.

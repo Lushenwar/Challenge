@@ -19,10 +19,7 @@ use std::{
 };
 
 use clap::Parser;
-use engineering_challenge::{
-    conn,
-    exchange::{self, Exchange},
-};
+use engineering_challenge::exchange::{self, Exchange};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::json;
 use tokio::{net::TcpListener, time::Instant};
@@ -113,7 +110,12 @@ async fn main() -> anyhow::Result<()> {
 
 async fn relay(id: u64, tcp: tokio::net::TcpStream, s: Arc<Shared>) -> anyhow::Result<()> {
     let client = tokio_tungstenite::accept_async(tcp).await?;
-    let upstream = conn::connect(s.exchange.ws_request(None)?).await?;
+    let (upstream, _) = engineering_challenge::net::connect(
+        s.exchange.ws_request(None)?,
+        &Default::default(),
+        id as usize,
+    )
+    .await?;
     let (mut cw, mut cr) = client.split();
     let (mut uw, mut ur) = upstream.split();
     let mut rng = Rng(now_us() as u64 ^ id.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);

@@ -117,6 +117,7 @@ fn main() -> anyhow::Result<()> {
     let mut r = AlignedSbeReader::<OrderbookSchema>::open(&args.capture)?;
     let mut symbols: HashMap<String, Symbol> = HashMap::new();
     let mut messages = 0u64;
+    let mut lag = Lag::default();
     // First few problems, for diagnosis: (kind, symbol, previous_us, this_us).
     let mut examples: Vec<(&str, String, i64, i64)> = Vec::new();
     while let Some(msg) = r.read_msg()? {
@@ -171,6 +172,7 @@ fn main() -> anyhow::Result<()> {
                 let st = symbols.entry(u.symbol.clone()).or_default();
                 st.updates += 1;
                 let at = u.backtest_timestamp.timestamp_micros();
+                lag.add(at - u.exchange_timestamp.timestamp_micros());
                 if check_ts(st, at) && examples.len() < 10 {
                     examples.push(("regression_update", u.symbol.clone(), st.last_ts, at));
                 }
@@ -208,6 +210,7 @@ fn main() -> anyhow::Result<()> {
         "max_snapshot_interval_us": symbols.values().map(|s| s.max_interval_us).max(),
         "timestamp_regressions": sum(|s| s.timestamp_regressions),
         "events_loaded": events.len(),
+        "receive_minus_exchange_us": lag.summary(),
         "examples": examples,
         "per_symbol": symbols.iter().collect::<BTreeMap<_, _>>(),
     });
@@ -219,6 +222,56 @@ fn main() -> anyhow::Result<()> {
     std::process::exit(if unexplained == 0 { 0 } else { 1 });
 }
 
+/// Histogram of update receive time minus exchange time, 100 µs buckets over ±10 s
+/// (includes any host clock offset, so compare runs, not absolute values).
+struct Lag {
+    buckets: Vec<u64>,
+    n: u64,
+}
+
+const LAG_BUCKET_US: i64 = 100;
+const LAG_SPAN_US: i64 = 10_000_000;
+
+impl Default for Lag {
+    fn default() -> Self {
+        Self {
+            buckets: vec![0; (2 * LAG_SPAN_US / LAG_BUCKET_US + 1) as usize],
+            n: 0,
+        }
+    }
+}
+
+impl Lag {
+    fn add(&mut self, us: i64) {
+        let i = (us.clamp(-LAG_SPAN_US, LAG_SPAN_US) + LAG_SPAN_US) / LAG_BUCKET_US;
+        self.buckets[i as usize] += 1;
+        self.n += 1;
+    }
+
+    /// p-th percentile (0..=100), bucket lower edge.
+    fn pct(&self, p: u64) -> Option<i64> {
+        let want = (self.n * p).div_ceil(100).max(1);
+        let mut seen = 0;
+        self.buckets
+            .iter()
+            .position(|&c| {
+                seen += c;
+                seen >= want
+            })
+            .map(|i| i as i64 * LAG_BUCKET_US - LAG_SPAN_US)
+    }
+
+    fn summary(&self) -> serde_json::Value {
+        if self.n == 0 {
+            return serde_json::Value::Null;
+        }
+        serde_json::json!({
+            "n": self.n, "p1": self.pct(1), "p10": self.pct(10), "p50": self.pct(50),
+            "p90": self.pct(90), "p99": self.pct(99),
+        })
+    }
+}
+
 /// Records `ts`; true if it went back in time for this symbol.
 fn check_ts(st: &mut Symbol, ts: i64) -> bool {
     let back = ts < st.last_ts;
@@ -227,4 +280,23 @@ fn check_ts(st: &mut Symbol, ts: i64) -> bool {
     }
     st.last_ts = st.last_ts.max(ts);
     back
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lag_percentiles() {
+        let mut l = Lag::default();
+        for us in (1..=100).map(|i| i * 1_000) {
+            l.add(us); // 1 ms .. 100 ms
+        }
+        l.add(-50_000_000); // clamped into the lowest bucket
+        assert_eq!(l.pct(50), Some(50_000));
+        assert_eq!(l.pct(99), Some(99_000));
+        assert_eq!(l.pct(0), Some(-LAG_SPAN_US));
+        assert_eq!(l.pct(1), Some(1_000));
+        assert!(Lag::default().summary().is_null());
+    }
 }

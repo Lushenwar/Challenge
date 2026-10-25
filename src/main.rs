@@ -37,6 +37,12 @@ struct Args {
     /// Also write the final report here.
     #[arg(long)]
     report: Option<PathBuf>,
+    /// Race N handshakes per (re)connect across the host's addresses; keep the fastest.
+    #[arg(long, default_value_t = 1)]
+    race: usize,
+    /// Pin local source ports: socket i uses BASE + i * race (+ attempt).
+    #[arg(long)]
+    source_port_base: Option<u16>,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -91,6 +97,11 @@ async fn collect(args: Args) -> anyhow::Result<()> {
         drop_conn: args.drop_conn,
         discovery_every: Duration::from_secs(args.discovery_secs),
         max_markets: args.max_markets,
+        net: engineering_challenge::net::NetOpts {
+            race: args.race,
+            source_port_base: args.source_port_base,
+            ..Default::default()
+        },
     };
     let control = tokio::spawn(control::run(cfg, markets, ev_tx, ctl_rx, stop_rx));
     let arbiter = tokio::spawn(arbiter::run(ev_rx, out_tx, ctl_tx));

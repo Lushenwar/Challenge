@@ -1,0 +1,29 @@
+{
+ "experiment": "c1-baseline",
+ "args": "",
+ "verify_exit": 0,
+ "updates_written": 2769555,
+ "unexplained": 0,
+ "receive_minus_exchange_us": {
+  "n": 2769555,
+  "p1": 2181800,
+  "p10": 2186600,
+  "p50": 2203300,
+  "p90": 2355900,
+  "p99": 4992200
+ },
+ "first_share_by_socket_pct": {
+  "0": 22.0,
+  "1": 15.4,
+  "2": 9.7,
+  "3": 14.4,
+  "4": 9.2,
+  "5": 11.9,
+  "6": 9.9,
+  "7": 7.4
+ },
+ "contested_updates": 1918083,
+ "switches_faster": 39,
+ "failovers": 696,
+ "sockets": 8
+}

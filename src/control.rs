@@ -40,6 +40,7 @@ pub struct Config {
     pub discovery_every: Duration,
     /// Cap on collected markets (testing); `None` = every live market.
     pub max_markets: Option<usize>,
+    pub net: crate::net::NetOpts,
 }
 
 #[derive(Debug, Default, Clone, Serialize)]
@@ -240,6 +241,7 @@ impl Control {
             tickers,
             // Two connections carry the (market-global) lifecycle feed, for redundancy.
             lifecycle: conn < 2,
+            net: self.cfg.net.clone(),
         };
         self.handles.push(tokio::spawn(conn::run(
             spec,
