@@ -23,7 +23,7 @@ use crate::{
         codec::Lifecycle,
         discovery::{self, MarketInfo},
     },
-    model::{ConnEvent, ConnId},
+    model::{ConnEvent, ConnId, ControlMsg},
     planner::Planner,
 };
 
@@ -74,7 +74,7 @@ pub async fn run(
     cfg: Config,
     initial: Vec<MarketInfo>,
     events: mpsc::Sender<ConnEvent>,
-    mut lifecycle: mpsc::UnboundedReceiver<(String, Lifecycle)>,
+    mut from_arbiter: mpsc::UnboundedReceiver<ControlMsg>,
     stop: watch::Receiver<bool>,
 ) -> (ControlStats, Vec<ConnStats>) {
     let mut c = Control {
@@ -113,18 +113,31 @@ pub async fn run(
                 }
                 next.as_mut().reset(tokio::time::Instant::now() + c.cfg.discovery_every);
             }
-            Some((market, event)) = lifecycle.recv() => {
-                if matches!(event, Lifecycle::Activated | Lifecycle::Reactivated) {
-                    c.tombstones.remove(&market); // discovery may add it again
+            Some(msg) = from_arbiter.recv() => match msg {
+                ControlMsg::Resubscribe { conn, market } => {
+                    // Only if it is still collected (it may have been removed since).
+                    if let Some(tx) = c.conns.get(conn).filter(|_| c.planner.contains(&market)) {
+                        let _ = tx.send(ConnCmd::Resubscribe(vec![market]));
+                    }
                 }
-                if matches!(event, Lifecycle::Determined | Lifecycle::Settled | Lifecycle::Deactivated)
-                    && c.planner.contains(&market)
-                {
-                    tracing::info!(%market, ?event, "market removed (lifecycle)");
-                    c.stats.removed_lifecycle += 1;
-                    c.remove(&[market]);
+                ControlMsg::Recycle(conn) => {
+                    if let Some(tx) = c.conns.get(conn) {
+                        let _ = tx.send(ConnCmd::Drop);
+                    }
                 }
-            }
+                ControlMsg::Lifecycle(market, event) => {
+                    if matches!(event, Lifecycle::Activated | Lifecycle::Reactivated) {
+                        c.tombstones.remove(&market); // discovery may add it again
+                    }
+                    if matches!(event, Lifecycle::Determined | Lifecycle::Settled | Lifecycle::Deactivated)
+                        && c.planner.contains(&market)
+                    {
+                        tracing::info!(%market, ?event, "market removed (lifecycle)");
+                        c.stats.removed_lifecycle += 1;
+                        c.remove(&[market]);
+                    }
+                }
+            },
             _ = &mut drop_hook, if drop_at.is_some() => {
                 let (conn, _) = drop_at.expect("guarded");
                 if let Some(tx) = c.conns.get(conn) {

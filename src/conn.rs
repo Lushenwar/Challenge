@@ -160,6 +160,43 @@ impl ConnState {
         }
     }
 
+    /// Drop and re-request `tickers` (`delete_markets` then `subscribe`). Each becomes
+    /// Pending; an `Invalidated` event goes out for any that had a valid book.
+    pub fn resubscribe(&mut self, tickers: Vec<String>) -> Vec<Action> {
+        let mut out = Vec::new();
+        let known: Vec<String> = tickers
+            .into_iter()
+            .filter(|t| self.markets.contains_key(t))
+            .collect();
+        for t in &known {
+            let m = self.markets.get_mut(t).expect("filtered");
+            if m.book.is_some() {
+                out.push(Action::Event(ConnEvent::Invalidated {
+                    conn: self.conn,
+                    market: t.clone(),
+                }));
+            }
+            *m = Market::default();
+        }
+        if !self.connected || known.is_empty() {
+            return out; // the next connect subscribes them anyway
+        }
+        if let Some(sid) = self.ob_sid {
+            self.next_id += 1;
+            out.push(Action::Send(
+                json!({"id": self.next_id, "cmd": "update_subscription",
+                    "params": {"sids": [sid], "market_tickers": known, "action": "delete_markets"}})
+                .to_string(),
+            ));
+        }
+        out.extend(
+            self.orderbook_subscribe(&known)
+                .into_iter()
+                .map(Action::Send),
+        );
+        out
+    }
+
     /// Stop collecting `tickers`: a `Removed` event per market (in order with every
     /// earlier event) and a `delete_markets` command.
     pub fn remove_markets(&mut self, tickers: &[String]) -> Vec<Action> {
@@ -407,7 +444,10 @@ impl ConnState {
 pub enum ConnCmd {
     Add(Vec<String>),
     Remove(Vec<String>),
-    /// Test hook: drop the socket now (it reconnects as after any failure).
+    /// Unsubscribe and resubscribe these markets: they become Pending until a fresh
+    /// subscription snapshot arrives.
+    Resubscribe(Vec<String>),
+    /// Drop the socket now; it reconnects as after any failure (health recycle, tests).
     Drop,
 }
 
@@ -416,6 +456,7 @@ impl ConnState {
         match cmd {
             ConnCmd::Add(t) => self.add_markets(t).into_iter().map(Action::Send).collect(),
             ConnCmd::Remove(t) => self.remove_markets(&t),
+            ConnCmd::Resubscribe(t) => self.resubscribe(t),
             ConnCmd::Drop => Vec::new(),
         }
     }
@@ -642,6 +683,39 @@ mod tests {
             }
         ));
         assert!(!s.resync_overdue(i64::MAX));
+    }
+
+    #[test]
+    fn resubscribe_deletes_resubscribes_and_waits_for_a_fresh_snapshot() {
+        let mut s = ConnState::new(0, &["T".into()], false);
+        s.subscribe_cmds();
+        s.on_frame(
+            r#"{"type":"subscribed","id":1,"msg":{"channel":"orderbook_delta","sid":2}}"#,
+            0,
+        );
+        s.on_frame(&snap(1, None, r#"["0.4000","1.00"]"#), 1);
+        let a = s.resubscribe(vec!["T".into(), "UNKNOWN".into()]);
+        assert!(matches!(
+            &a[0],
+            Action::Event(ConnEvent::Invalidated { .. })
+        ));
+        assert!(
+            matches!(&a[1], Action::Send(c) if c.contains("delete_markets") && c.contains("\"T\""))
+        );
+        assert!(
+            matches!(&a[2], Action::Send(c) if c.contains("\"subscribe\"") && !c.contains("UNKNOWN"))
+        );
+        assert_eq!(a.len(), 3);
+        // Pending again: deltas dropped until the new subscription snapshot.
+        assert!(s.on_frame(&delta(2, "1.00"), 2).is_empty());
+        let e = events(s.on_frame(&snap(3, None, r#"["0.4000","4.00"]"#), 3));
+        assert!(matches!(
+            e[0],
+            ConnEvent::Snapshot {
+                cause: SnapCause::Subscribed,
+                ..
+            }
+        ));
     }
 
     #[test]

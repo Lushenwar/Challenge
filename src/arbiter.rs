@@ -4,7 +4,7 @@
 //! any of its deltas. What has been written always equals the active source's book.
 
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     time::Duration,
 };
 
@@ -15,8 +15,8 @@ use tokio::sync::mpsc;
 
 use crate::{
     book::OrderBook,
-    exchange::kalshi::codec::Lifecycle,
-    model::{ConnEvent, ConnId, OutMsg, SnapCause, now_us},
+    health::{self, Rate, Recycler},
+    model::{ConnEvent, ConnId, ControlMsg, OutMsg, SnapCause, now_us},
     util::dtos::challenge_orderbook::{
         PriceLevelUpdateDomain, SnapshotAsksEntryDomain, SnapshotBidsEntryDomain, SnapshotDomain,
     },
@@ -35,6 +35,11 @@ pub struct ArbiterStats {
     pub writer_blocked_us: i64,
     pub lifecycle_events: u64,
     pub removed: u64,
+    /// Failovers because the active source fell behind a replica (health rule 1).
+    pub failovers_stale: u64,
+    pub resubscribes_lag: u64,
+    pub resubscribes_rate: u64,
+    pub recycles: u64,
 }
 
 #[derive(Default)]
@@ -46,6 +51,10 @@ struct Source {
     exch_us: i64,
     /// Local receive time of that event.
     recv_us: i64,
+    /// Exchange time of the latest *delta*: what replicas are compared on. Snapshots
+    /// carry Kalshi's send time, not an event time, so they do not count.
+    delta_us: i64,
+    rate: Rate,
 }
 
 #[derive(Default)]
@@ -57,6 +66,8 @@ struct Market {
     removed: bool,
     /// Latest timestamp written for this symbol; output time never goes back.
     last_out_us: i64,
+    /// Since when a replica has been ahead of the active source.
+    lag_since: Option<i64>,
 }
 
 impl Market {
@@ -68,13 +79,38 @@ impl Market {
             .max_by_key(|(c, s)| (s.exch_us, std::cmp::Reverse(**c)))
             .map(|(c, _)| *c)
     }
+
+    /// Rule 1 bookkeeping after a delta: is a valid replica ahead of the active source?
+    fn track_lag(&mut self, now_us: i64) -> bool {
+        let Some(a) = self.active else {
+            self.lag_since = None;
+            return false;
+        };
+        let active = self.sources.get(&a).map_or(0, |s| s.delta_us);
+        let ahead = self
+            .sources
+            .iter()
+            .any(|(c, s)| *c != a && s.book.is_some() && s.delta_us > active);
+        if ahead {
+            self.lag_since.get_or_insert(now_us);
+        } else {
+            self.lag_since = None;
+        }
+        ahead
+    }
 }
 
 #[derive(Default)]
 pub struct Arbiter {
     markets: HashMap<String, Market>,
-    /// Lifecycle events for the control task, drained by [`run`].
-    pub lifecycle: Vec<(String, Lifecycle)>,
+    /// Messages for the control task (lifecycle events, health actions), drained by
+    /// [`run`].
+    pub control: Vec<ControlMsg>,
+    /// Markets with a replica ahead of the active source.
+    lagging: HashSet<String>,
+    conns: BTreeSet<ConnId>,
+    recycler: Recycler,
+    last_recycle_check: i64,
     /// `(market, cause, received_at)` of every non-periodic snapshot written; [`run`]
     /// logs them to stderr, where `verify --events` pairs them with the capture.
     pub snapshot_log: Vec<(String, SnapCause, i64)>,
@@ -99,7 +135,17 @@ impl Arbiter {
                 if m.removed {
                     return;
                 }
+                self.conns.insert(conn);
+                // A fresh snapshot already holds every delta its replicas applied so far,
+                // so for rule 1 it has caught up with them.
+                let caught_up = m
+                    .sources
+                    .iter()
+                    .filter(|(c, _)| **c != conn)
+                    .map(|(_, s)| s.delta_us)
+                    .max();
                 let src = m.sources.entry(conn).or_default();
+                src.delta_us = src.delta_us.max(caught_up.unwrap_or(0));
                 src.book = Some(book);
                 src.exch_us = exch_us;
                 src.recv_us = recv_us;
@@ -132,6 +178,11 @@ impl Arbiter {
                 book.set_level(side, price, qty);
                 src.exch_us = exch_us;
                 src.recv_us = recv_us;
+                src.delta_us = exch_us;
+                src.rate.hit();
+                if m.track_lag(recv_us) {
+                    self.lagging.insert(market.clone());
+                }
                 if m.active == Some(conn) && !m.removed {
                     self.stats.updates += 1;
                     m.last_out_us = m.last_out_us.max(recv_us);
@@ -160,7 +211,7 @@ impl Arbiter {
             }
             ConnEvent::Lifecycle { market, event, .. } => {
                 self.stats.lifecycle_events += 1;
-                self.lifecycle.push((market, event));
+                self.control.push(ControlMsg::Lifecycle(market, event));
             }
             ConnEvent::Removed { conn, market } => {
                 let Some(m) = self.markets.get_mut(&market) else {
@@ -226,6 +277,101 @@ impl Arbiter {
             None => {
                 m.active = None;
                 m.gap_since = Some(last_data);
+            }
+        }
+    }
+
+    /// Health rules 1 and 4; call often (every 250 ms).
+    pub fn on_tick(&mut self, now_us: i64, out: &mut Vec<OutMsg>) {
+        let lagging: Vec<String> = self.lagging.drain().collect();
+        for market in lagging {
+            let Some(m) = self.markets.get_mut(&market) else {
+                continue;
+            };
+            let (Some(since), Some(stale), false) = (m.lag_since, m.active, m.removed) else {
+                continue; // caught up, silent, or removed
+            };
+            if now_us - since < health::LAG_LIMIT_US {
+                self.lagging.insert(market);
+                continue;
+            }
+            let next = m
+                .sources
+                .iter()
+                .filter(|(c, s)| **c != stale && s.book.is_some())
+                .max_by_key(|(c, s)| (s.delta_us, std::cmp::Reverse(**c)))
+                .map(|(c, _)| *c);
+            let Some(next) = next else { continue };
+            m.lag_since = None;
+            m.active = Some(next);
+            let at = m.sources[&next].recv_us.max(m.last_out_us);
+            m.last_out_us = at;
+            let log = &mut self.snapshot_log;
+            emit(
+                &market,
+                m,
+                next,
+                at,
+                SnapCause::Stale,
+                out,
+                log,
+                &mut self.stats,
+            );
+            self.stats.failovers += 1;
+            self.stats.failovers_stale += 1;
+            self.stats.resubscribes_lag += 1;
+            tracing::warn!(%market, stale, next, "active source fell behind; failed over");
+            self.control.push(ControlMsg::Resubscribe {
+                conn: stale,
+                market,
+            });
+        }
+        if now_us - self.last_recycle_check >= 10_000_000 {
+            self.last_recycle_check = now_us;
+            let conns: Vec<ConnId> = self.conns.iter().copied().collect();
+            for conn in conns {
+                if self.recycler.due(conn, now_us) && self.safe_to_recycle(conn) {
+                    self.recycler.recycled(conn, now_us);
+                    self.stats.recycles += 1;
+                    tracing::info!(conn, "recycling connection");
+                    self.control.push(ControlMsg::Recycle(conn));
+                    break;
+                }
+            }
+        }
+    }
+
+    /// Rule 4 guard: every market on `conn` has another valid replica.
+    pub fn safe_to_recycle(&self, conn: ConnId) -> bool {
+        self.markets
+            .values()
+            .filter(|m| !m.removed && m.sources.contains_key(&conn))
+            .all(|m| {
+                m.sources
+                    .iter()
+                    .any(|(c, s)| *c != conn && s.book.is_some())
+            })
+    }
+
+    /// Health rule 2; call once per minute. Never resubscribes the active source while a
+    /// valid replica exists: that would open a gap, and a silent active source is caught
+    /// by rule 1 through its replica. With one replica, the only source is resubscribed.
+    pub fn health_minute(&mut self, now_us: i64) {
+        for (market, m) in &mut self.markets {
+            if m.removed {
+                continue;
+            }
+            let valid = m.sources.values().filter(|s| s.book.is_some()).count();
+            let active = m.active;
+            for (conn, src) in &mut m.sources {
+                let collapsed = src.rate.on_minute(now_us);
+                let spare = active != Some(*conn) || valid == 1;
+                if collapsed && src.book.is_some() && spare {
+                    self.stats.resubscribes_rate += 1;
+                    tracing::warn!(%market, conn, "message rate collapsed; resubscribing");
+                    let (conn, market) = (*conn, market.clone());
+                    self.control.push(ControlMsg::Resubscribe { conn, market });
+                }
             }
         }
     }
@@ -328,12 +474,13 @@ fn until_next_minute() -> Duration {
 pub async fn run(
     mut events: mpsc::Receiver<ConnEvent>,
     writer: Sender<OutMsg>,
-    lifecycle: mpsc::UnboundedSender<(String, Lifecycle)>,
+    control: mpsc::UnboundedSender<ControlMsg>,
 ) -> ArbiterStats {
     let mut a = Arbiter::default();
     let mut buf = Vec::new();
     let minute = tokio::time::sleep(until_next_minute());
     tokio::pin!(minute);
+    let mut tick = tokio::time::interval(Duration::from_millis(250));
     loop {
         tokio::select! {
             ev = events.recv() => match ev {
@@ -342,16 +489,19 @@ pub async fn run(
             },
             _ = &mut minute => {
                 a.stats.periodic_rounds += 1;
-                a.snapshot_all(now_us(), SnapCause::Periodic, &mut buf);
+                let now = now_us();
+                a.snapshot_all(now, SnapCause::Periodic, &mut buf);
+                a.health_minute(now);
                 minute.as_mut().reset(tokio::time::Instant::now() + until_next_minute());
             }
+            _ = tick.tick() => a.on_tick(now_us(), &mut buf),
         }
         for (market, cause, at) in a.snapshot_log.drain(..) {
             log_snapshot(&market, cause, at);
         }
         send_all(&writer, &mut buf, &mut a.stats);
-        for ev in a.lifecycle.drain(..) {
-            let _ = lifecycle.send(ev); // control may already be gone at shutdown
+        for msg in a.control.drain(..) {
+            let _ = control.send(msg); // control may already be gone at shutdown
         }
     }
     a.snapshot_all(now_us(), SnapCause::Shutdown, &mut buf);
@@ -490,6 +640,168 @@ mod tests {
         a.on_event(snap(1, 300_000, now_us()), &mut out);
         assert_eq!(bids(out.last().unwrap()), vec![(300_000, 5)]);
         assert_eq!(a.stats.gaps, 1);
+    }
+
+    /// Phase 7 (a): the active source goes silent for a market while its replica keeps
+    /// moving; failover happens once the replica has been ahead for 2s, not before.
+    #[test]
+    fn silenced_active_source_fails_over_within_2s_of_replica_moving_ahead() {
+        let mut a = Arbiter::default();
+        let mut out = Vec::new();
+        a.on_event(snap(0, 400_000, 1), &mut out);
+        a.on_event(snap(1, 400_000, 1), &mut out);
+        // Both see a delta at t=500: no lag.
+        a.on_event(update(1, 6, 500), &mut out);
+        a.on_event(update(0, 6, 500), &mut out);
+        a.on_tick(10_000_000, &mut out);
+        assert_eq!(a.stats.failovers_stale, 0);
+        // Now only the replica moves.
+        let t = 20_000_000;
+        a.on_event(update(1, 9, t), &mut out);
+        a.on_tick(t + health::LAG_LIMIT_US - 1, &mut out);
+        assert_eq!(a.stats.failovers_stale, 0);
+        a.on_tick(t + health::LAG_LIMIT_US, &mut out);
+        assert_eq!(a.stats.failovers_stale, 1);
+        assert_eq!(bids(out.last().unwrap()), vec![(400_000, 9)]); // the replica's book
+        assert!(a.control.contains(&ControlMsg::Resubscribe {
+            conn: 0,
+            market: "T".into()
+        }));
+        // Its deltas are forwarded from now on; the stale source's are not.
+        let n = out.len();
+        a.on_event(update(0, 1, t + 3_000_000), &mut out);
+        assert_eq!(out.len(), n);
+        a.on_event(update(1, 2, t + 3_000_000), &mut out);
+        assert_eq!(out.len(), n + 1);
+    }
+
+    #[test]
+    fn a_replica_that_catches_up_is_not_failed_over() {
+        let mut a = Arbiter::default();
+        let mut out = Vec::new();
+        a.on_event(snap(0, 400_000, 1), &mut out);
+        a.on_event(snap(1, 400_000, 1), &mut out);
+        a.on_event(update(1, 6, 1_000), &mut out); // replica first...
+        a.on_event(update(0, 6, 1_000), &mut out); // ...active a moment later
+        a.on_tick(10_000_000, &mut out);
+        assert_eq!(a.stats.failovers_stale, 0);
+        assert!(a.control.is_empty());
+    }
+
+    /// Phase 7 (b): a collapsed message rate on a source triggers a resubscribe there.
+    #[test]
+    fn rate_collapsed_market_is_resubscribed() {
+        const MIN: i64 = 60_000_000;
+        let mut a = Arbiter::default();
+        let mut out = Vec::new();
+        a.on_event(snap(0, 400_000, 1), &mut out);
+        for minute in 0..10 {
+            for i in 0..100 {
+                a.on_event(update(0, i + 1, minute * MIN + i), &mut out);
+            }
+            a.health_minute((minute + 1) * MIN);
+        }
+        assert!(a.control.is_empty());
+        a.on_event(update(0, 5, 10 * MIN + 1), &mut out); // 1 message instead of ~100
+        a.health_minute(11 * MIN);
+        assert_eq!(
+            a.control,
+            vec![ControlMsg::Resubscribe {
+                conn: 0,
+                market: "T".into()
+            }]
+        );
+        assert_eq!(a.stats.resubscribes_rate, 1);
+    }
+
+    /// Found live: a quiet market must not have both replicas resubscribed at once.
+    #[test]
+    fn rate_collapse_with_a_valid_replica_spares_the_active_source() {
+        const MIN: i64 = 60_000_000;
+        let mut a = Arbiter::default();
+        let mut out = Vec::new();
+        a.on_event(snap(0, 400_000, 1), &mut out);
+        a.on_event(snap(1, 400_000, 1), &mut out);
+        for minute in 0..10 {
+            for i in 0..100 {
+                let t = minute * MIN + i;
+                a.on_event(update(0, i + 1, t), &mut out);
+                a.on_event(update(1, i + 1, t), &mut out);
+            }
+            a.health_minute((minute + 1) * MIN);
+        }
+        a.health_minute(11 * MIN); // the market goes quiet on both
+        assert_eq!(
+            a.control,
+            vec![ControlMsg::Resubscribe {
+                conn: 1,
+                market: "T".into()
+            }]
+        );
+    }
+
+    /// Found live: a source that just took a snapshot is not "behind" a replica that
+    /// applied, as a delta, a change the snapshot already contains.
+    #[test]
+    fn a_fresh_snapshot_is_not_stale() {
+        let mut a = Arbiter::default();
+        let mut out = Vec::new();
+        a.on_event(snap(1, 400_000, 1), &mut out); // conn 1 active
+        a.on_event(update(1, 6, 1_000), &mut out);
+        a.on_event(ConnEvent::Disconnected { conn: 1 }, &mut out); // gap
+        a.on_event(snap(0, 400_000, 2_000), &mut out); // conn 0 closes the gap
+        a.on_event(snap(1, 400_000, 3_000), &mut out); // conn 1 back as backup
+        a.on_event(update(1, 7, 4_000), &mut out); // ...and conn 0 sees it a moment later
+        a.on_event(update(0, 7, 4_000), &mut out);
+        a.on_tick(60_000_000, &mut out);
+        assert_eq!(a.stats.failovers_stale, 0);
+    }
+
+    /// Phase 7 (c): a socket is never recycled while one of its markets has no other
+    /// valid replica.
+    #[test]
+    fn recycle_waits_until_every_market_has_another_valid_replica() {
+        const MIN: i64 = 60_000_000;
+        let mut a = Arbiter::default();
+        let mut out = Vec::new();
+        let book_on = |conn, market: &str| ConnEvent::Snapshot {
+            conn,
+            market: market.into(),
+            book: book(400_000),
+            recv_us: 1,
+            exch_us: 1,
+            cause: SnapCause::Subscribed,
+        };
+        a.on_event(book_on(0, "T"), &mut out);
+        a.on_event(book_on(1, "T"), &mut out);
+        a.on_event(book_on(0, "U"), &mut out);
+        a.on_event(book_on(1, "U"), &mut out);
+        a.on_event(
+            ConnEvent::Invalidated {
+                conn: 1,
+                market: "U".into(),
+            },
+            &mut out,
+        );
+        a.on_tick(10_000_000, &mut out); // schedules both sockets 30–45 min out
+        let recycled = |a: &Arbiter, c| a.control.contains(&ControlMsg::Recycle(c));
+        let mut now = 10_000_000 + 46 * MIN;
+        for _ in 0..20 {
+            a.on_tick(now, &mut out);
+            now += 10_000_000;
+        }
+        // U lives only on socket 0, so socket 0 must not be recycled; socket 1 may be.
+        assert!(!recycled(&a, 0));
+        assert!(!a.safe_to_recycle(0));
+        assert!(recycled(&a, 1));
+        // Once U is valid on socket 1 again, socket 0 can go.
+        a.on_event(book_on(1, "U"), &mut out);
+        assert!(a.safe_to_recycle(0));
+        for _ in 0..5 {
+            a.on_tick(now, &mut out);
+            now += 10_000_000;
+        }
+        assert!(recycled(&a, 0));
     }
 
     #[test]

@@ -74,7 +74,7 @@ async fn collect(args: Args) -> anyhow::Result<()> {
 
     let (out_tx, writer) = writer::spawn(args.output.clone())?;
     let (ev_tx, ev_rx) = mpsc::channel(100_000);
-    let (life_tx, life_rx) = mpsc::unbounded_channel();
+    let (ctl_tx, ctl_rx) = mpsc::unbounded_channel();
     let (stop_tx, stop_rx) = watch::channel(false);
     let cfg = control::Config {
         env: args.env,
@@ -85,8 +85,8 @@ async fn collect(args: Args) -> anyhow::Result<()> {
         discovery_every: Duration::from_secs(args.discovery_secs),
         max_markets: args.max_markets,
     };
-    let control = tokio::spawn(control::run(cfg, markets, ev_tx, life_rx, stop_rx));
-    let arbiter = tokio::spawn(arbiter::run(ev_rx, out_tx, life_tx));
+    let control = tokio::spawn(control::run(cfg, markets, ev_tx, ctl_rx, stop_rx));
+    let arbiter = tokio::spawn(arbiter::run(ev_rx, out_tx, ctl_tx));
 
     shutdown_signal().await;
     tracing::info!("shutting down");

@@ -34,6 +34,8 @@ pub enum SnapCause {
     Removed,
     /// The active source was lost; this is the new source's book.
     Failover,
+    /// The active source fell behind a replica for over 2s; this is the replica's book.
+    Stale,
 }
 
 /// Facts a connection reports. It never decides what is written.
@@ -69,6 +71,19 @@ pub enum ConnEvent {
     /// The connection stopped collecting `market` (control removed it). Comes after
     /// every earlier event for that market on this connection.
     Removed { conn: ConnId, market: String },
+}
+
+/// From the arbiter to the control task.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ControlMsg {
+    Lifecycle(String, Lifecycle),
+    /// Unsubscribe and resubscribe `market` on `conn` (health rules 1 and 2).
+    Resubscribe {
+        conn: ConnId,
+        market: String,
+    },
+    /// Fully reconnect `conn` (health rule 4).
+    Recycle(ConnId),
 }
 
 #[derive(Debug, PartialEq)]
