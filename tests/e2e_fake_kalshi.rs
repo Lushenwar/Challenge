@@ -46,7 +46,7 @@ fn key_file(dir: &Path) -> PathBuf {
     path
 }
 
-fn start(fake: &Fake, dir: &Path, markets_per_socket: usize) -> Child {
+fn start(fake: &Fake, dir: &Path, markets_per_socket: usize, replicas: usize) -> Child {
     let log = std::fs::File::create(dir.join("collector.log")).unwrap();
     Command::new(env!("CARGO_BIN_EXE_engineering-challenge"))
         .args([
@@ -57,7 +57,7 @@ fn start(fake: &Fake, dir: &Path, markets_per_socket: usize) -> Child {
             "--ws-url",
             &fake.ws_url,
         ])
-        .args(["--discovery-secs", "1", "--replicas", "2"])
+        .args(["--discovery-secs", "1", "--replicas", &replicas.to_string()])
         .args(["--markets-per-socket", &markets_per_socket.to_string()])
         .arg("--key-path")
         .arg(key_file(dir))
@@ -79,8 +79,18 @@ async fn run(
     total: Duration,
     faults: Vec<(Duration, Fault)>,
 ) -> Run {
+    run_with(fake, markets_per_socket, 2, total, faults).await
+}
+
+async fn run_with(
+    fake: Fake,
+    markets_per_socket: usize,
+    replicas: usize,
+    total: Duration,
+    faults: Vec<(Duration, Fault)>,
+) -> Run {
     let dir = tempfile::tempdir().unwrap();
-    let mut child = start(&fake, dir.path(), markets_per_socket);
+    let mut child = start(&fake, dir.path(), markets_per_socket, replicas);
     let t0 = tokio::time::Instant::now();
     for (at, f) in faults {
         tokio::time::sleep_until(t0 + at).await;
@@ -447,6 +457,98 @@ async fn slow_socket_fails_over_to_the_fresher_replica() {
     .await;
     assert_true_to_the_exchange(&run, 20);
     assert!(arbiter(&run, "failovers_stale") >= 1, "{}", run.report);
+}
+
+/// Hard rule 8: on SIGINT the capture ends in a known state, a final snapshot of every
+/// market (equal to its true book, checked by `check`), after the last update.
+#[tokio::test(flavor = "multi_thread")]
+async fn sigint_ends_every_market_with_a_final_snapshot() {
+    let run = run(Fake::start(20, 300, 12).await, 5000, S(5), vec![]).await;
+    assert_true_to_the_exchange(&run, 20);
+    let mut last: HashMap<String, bool> = HashMap::new(); // symbol -> last was a snapshot
+    let mut r = AlignedSbeReader::<OrderbookSchema>::open(&run.cap).unwrap();
+    while let Some(msg) = r.read_msg().unwrap() {
+        match msg {
+            AnyMessage::Snapshot(s) => {
+                last.insert(SnapshotDomain::try_from_decoder(s).unwrap().symbol, true);
+            }
+            AnyMessage::PriceLevelUpdate(u) => {
+                last.insert(
+                    PriceLevelUpdateDomain::try_from_decoder(u).unwrap().symbol,
+                    false,
+                );
+            }
+            _ => panic!("unknown message"),
+        }
+    }
+    assert_eq!(last.len(), 20);
+    assert!(last.values().all(|&snap| snap), "{last:?}");
+    assert!(
+        std::fs::read_to_string(&run.log)
+            .unwrap()
+            .contains("cause=Shutdown")
+    );
+    assert!(run.report["writer"]["snapshots"].as_u64().unwrap() >= 40);
+}
+
+/// No lifecycle event: the market just stops being listed. Two complete discovery
+/// passes without it remove it (empty terminal snapshot); one pass is not enough.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_delisted_market_is_removed_after_two_complete_passes() {
+    let fake = Fake::start(20, 300, 9).await;
+    let gone = fake.markets[2].clone();
+    let run = run(fake, 5000, S(9), vec![(S(3), Fault::Delist(gone.clone()))]).await;
+    let c = assert_true_to_the_exchange(&run, 20);
+    assert!(c.ended.contains(&gone), "{c:?}");
+    assert!(
+        run.report["control"]["removed_discovery"].as_u64().unwrap() >= 1,
+        "{}",
+        run.report
+    );
+    assert_eq!(
+        run.report["control"]["removed_lifecycle"].as_u64().unwrap(),
+        0
+    );
+}
+
+/// Every socket dropped three times: each market keeps a valid replica only some of the
+/// time, but whatever is written is still the true book.
+#[tokio::test(flavor = "multi_thread")]
+async fn repeated_drops_never_write_a_wrong_book() {
+    let faults = vec![
+        (S(3), Fault::Drop(0)),
+        (S(5), Fault::Drop(1)),
+        (S(7), Fault::Drop(2)),
+        (S(9), Fault::Drop(3)),
+        (S(11), Fault::DropAll),
+    ];
+    let run = run(Fake::start(20, 300, 10).await, 5000, S(16), faults).await;
+    let c = check(&run);
+    assert!(c.errors.is_empty(), "{:#?}", c.errors);
+    assert!(
+        run.fake_stats["accepted"].as_u64().unwrap() >= 6,
+        "{}",
+        run.fake_stats
+    );
+    assert_eq!(verify(&run, true).0, 0);
+}
+
+/// With one replica there is nothing to fail over to: losing the socket is a gap, and
+/// the collector says so.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_single_replica_loss_is_a_reported_gap() {
+    let run = run_with(
+        Fake::start(20, 300, 11).await,
+        5000,
+        1,
+        S(10),
+        vec![(S(4), Fault::Drop(0))],
+    )
+    .await;
+    let c = check(&run);
+    assert!(c.errors.is_empty(), "{:#?}", c.errors);
+    assert!(arbiter(&run, "gaps") >= 1, "{}", run.report);
+    assert_eq!(run.report["control"]["sockets"].as_u64().unwrap(), 1);
 }
 
 /// Thousands of markets over many sockets, with one socket lost mid-run.

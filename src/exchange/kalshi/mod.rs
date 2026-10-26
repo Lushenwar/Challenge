@@ -219,3 +219,60 @@ impl Session for KalshiSession {
         Message::Ping(Vec::new().into())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn session(lifecycle: bool) -> KalshiSession {
+        KalshiSession {
+            next_id: 0,
+            ob_sid: None,
+            lifecycle,
+        }
+    }
+
+    fn markets(n: usize) -> Vec<String> {
+        (0..n).map(|i| format!("M{i}")).collect()
+    }
+
+    #[test]
+    fn subscribes_in_batches_with_increasing_ids() {
+        let mut s = session(true);
+        let cmds = s.on_connect(&markets(2 * BATCH + 1));
+        assert_eq!(cmds.len(), 4, "lifecycle + three order-book batches");
+        assert!(cmds[0].contains("market_lifecycle_v2"));
+        let ids: Vec<u64> = cmds
+            .iter()
+            .map(|c| {
+                serde_json::from_str::<serde_json::Value>(c).unwrap()["id"]
+                    .as_u64()
+                    .unwrap()
+            })
+            .collect();
+        assert_eq!(ids, [1, 2, 3, 4]);
+        let last: serde_json::Value = serde_json::from_str(&cmds[3]).unwrap();
+        assert_eq!(
+            last["params"]["market_tickers"].as_array().unwrap().len(),
+            1
+        );
+        assert!(!session(false).on_connect(&markets(1))[0].contains("lifecycle"));
+    }
+
+    #[test]
+    fn deletes_and_snapshot_requests_name_the_order_book_sid() {
+        let mut s = session(false);
+        assert!(
+            s.unsubscribe(&markets(1)).is_empty(),
+            "no sid yet: nothing to delete from"
+        );
+        s.decode(r#"{"type":"subscribed","id":1,"msg":{"channel":"orderbook_delta","sid":7}}"#)
+            .unwrap();
+        let del: serde_json::Value = serde_json::from_str(&s.unsubscribe(&markets(1))[0]).unwrap();
+        assert_eq!(del["params"]["sids"], serde_json::json!([7]));
+        assert_eq!(del["params"]["action"], "delete_markets");
+        let snap = s.request_snapshots(7, &markets(BATCH + 1)).unwrap();
+        assert_eq!(snap.len(), 2);
+        assert!(snap[0].contains("get_snapshot"));
+    }
+}

@@ -169,6 +169,16 @@ mod tests {
     }
 
     #[test]
+    fn set_level_is_absolute_and_zero_removes() {
+        let mut b = OrderBook::from_levels(&[(400_000, 10)], &[(600_000, 7)]).unwrap();
+        b.set_level(Side::Buy, 400_000, 3); // replaces, does not add
+        b.set_level(Side::Sell, 600_000, 0);
+        b.set_level(Side::Sell, 700_000, 2);
+        b.set_level(Side::Buy, 100_000, 0); // removing an absent level is a no-op
+        assert_eq!(b.levels(), (vec![(400_000, 3)], vec![(700_000, 2)]));
+    }
+
+    #[test]
     fn crossed_vs_locked() {
         let locked = OrderBook::from_levels(&[(500_000, 1)], &[(500_000, 1)]).unwrap();
         assert!(locked.is_crossed()); // best bid >= best ask

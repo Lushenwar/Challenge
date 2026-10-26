@@ -131,6 +131,23 @@ mod tests {
         }
     }
 
+    /// Kalshi wants milliseconds; a seconds or nanoseconds timestamp is rejected as
+    /// expired (`date +%s%3N` gave nanoseconds on the test machine).
+    #[test]
+    fn headers_use_the_current_time_in_milliseconds() {
+        let pem = ed25519_dalek::SigningKey::from_bytes(&[7; 32])
+            .to_pkcs8_pem(Default::default())
+            .unwrap();
+        let signer = Signer::new("id".into(), &pem).unwrap();
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        let [_, (_, ts), _] = signer.headers("GET", "/x");
+        assert_eq!(ts.len(), 13, "{ts}");
+        assert!((ts.parse::<i64>().unwrap() - now_ms).abs() < 5_000);
+    }
+
     #[test]
     fn rejects_garbage() {
         assert!(Signer::new("id".into(), "not a key").is_err());

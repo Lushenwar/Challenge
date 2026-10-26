@@ -158,6 +158,43 @@ pub async fn run(
     (c.stats, conn_stats)
 }
 
+/// One pass of the removal rule. `live`: every live market, if this pass knows it
+/// (`None`: a capped or failed listing, which counts nothing). A collected market missing
+/// from two such passes in a row is returned (sorted); seeing it again resets its count.
+fn count_misses<'a>(
+    misses: &mut HashMap<String, u32>,
+    collected: impl Iterator<Item = &'a String>,
+    live: Option<&HashSet<String>>,
+) -> Vec<String> {
+    let Some(live) = live else { return Vec::new() };
+    let mut gone = Vec::new();
+    for m in collected {
+        if live.contains(m) {
+            misses.remove(m);
+        } else {
+            let n = misses.entry(m.clone()).or_default();
+            *n += 1;
+            if *n >= 2 {
+                gone.push(m.clone());
+            }
+        }
+    }
+    gone.sort();
+    gone
+}
+
+/// Discovered markets to start collecting: not collected yet and not recently removed.
+fn addable(
+    markets: Vec<MarketInfo>,
+    collected: impl Fn(&str) -> bool,
+    tombstones: &HashMap<String, Instant>,
+) -> Vec<MarketInfo> {
+    markets
+        .into_iter()
+        .filter(|m| !collected(&m.ticker) && !tombstones.contains_key(&m.ticker))
+        .collect()
+}
+
 impl Control {
     async fn reconcile(&mut self, markets: Vec<MarketInfo>) {
         self.stats.discovery_passes += 1;
@@ -168,32 +205,14 @@ impl Control {
         } else {
             self.cfg.exchange.live_markets(&reqwest::Client::new())
         };
-        let mut gone = Vec::new();
-        for m in self.planner.markets().filter(|_| live.is_some()) {
-            let live = live.as_ref().expect("filtered");
-            if live.contains(m) {
-                self.misses.remove(m);
-            } else {
-                let n = self.misses.entry(m.clone()).or_default();
-                *n += 1;
-                if *n >= 2 {
-                    gone.push(m.clone());
-                }
-            }
-        }
+        let gone = count_misses(&mut self.misses, self.planner.markets(), live.as_ref());
         if !gone.is_empty() {
-            gone.sort();
             tracing::info!(count = gone.len(), first = %gone[0], "markets removed (missing from 2 passes)");
             self.stats.removed_discovery += gone.len() as u64;
             self.remove(&gone);
         }
         self.tombstones.retain(|_, t| t.elapsed() < TOMBSTONE);
-        let new: Vec<MarketInfo> = markets
-            .into_iter()
-            .filter(|m| {
-                !self.planner.contains(&m.ticker) && !self.tombstones.contains_key(&m.ticker)
-            })
-            .collect();
+        let new = addable(markets, |t| self.planner.contains(t), &self.tombstones);
         self.add(new).await;
     }
 
@@ -250,5 +269,63 @@ impl Control {
             self.stop.clone(),
         )));
         self.conns.push(tx);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn set(xs: &[&str]) -> HashSet<String> {
+        xs.iter().map(|x| x.to_string()).collect()
+    }
+
+    fn names(xs: &[&str]) -> Vec<String> {
+        xs.iter().map(|x| x.to_string()).collect()
+    }
+
+    #[test]
+    fn removed_only_after_two_complete_passes_in_a_row_miss_it() {
+        let collected = names(&["A", "B", "C"]);
+        let mut misses = HashMap::new();
+        assert!(count_misses(&mut misses, collected.iter(), Some(&set(&["A"]))).is_empty());
+        // B is back, C is missing a second time.
+        assert_eq!(
+            count_misses(&mut misses, collected.iter(), Some(&set(&["A", "B"]))),
+            ["C"]
+        );
+        // B's earlier miss was forgotten when it reappeared: one more miss is not enough.
+        assert!(
+            count_misses(&mut misses, names(&["A", "B"]).iter(), Some(&set(&["A"]))).is_empty()
+        );
+    }
+
+    #[test]
+    fn a_failed_or_capped_listing_counts_nothing() {
+        let collected = names(&["A"]);
+        let mut misses = HashMap::new();
+        assert!(count_misses(&mut misses, collected.iter(), Some(&set(&[]))).is_empty());
+        for _ in 0..5 {
+            assert!(count_misses(&mut misses, collected.iter(), None).is_empty());
+        }
+        assert_eq!(
+            misses["A"], 1,
+            "passes without a complete listing do not count"
+        );
+        assert_eq!(
+            count_misses(&mut misses, collected.iter(), Some(&set(&[]))),
+            ["A"]
+        );
+    }
+
+    #[test]
+    fn recently_removed_and_collected_markets_are_not_added() {
+        let m = |t: &str| MarketInfo {
+            ticker: t.into(),
+            volume_24h: 0,
+        };
+        let tomb = HashMap::from([("GONE".to_owned(), Instant::now())]);
+        let new = addable(vec![m("NEW"), m("HAVE"), m("GONE")], |t| t == "HAVE", &tomb);
+        assert_eq!(new, vec![m("NEW")]);
     }
 }

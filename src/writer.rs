@@ -273,6 +273,61 @@ mod tests {
         }
     }
 
+    /// The writer thread: bytes reach the file about a second after they are queued (not
+    /// when 64 MiB fill up), and once every sender is dropped the file is whole chunks
+    /// that the starter reader reads completely.
+    #[test]
+    fn the_writer_thread_writes_within_a_second_and_closes_whole_chunks() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("live.sbe");
+        let (tx, handle) = spawn(path.clone()).unwrap();
+        tx.send(snapshot("T", 3)).unwrap();
+        for i in 0..10 {
+            tx.send(update("T", i)).unwrap();
+        }
+        let len = |p: &std::path::Path| std::fs::metadata(p).unwrap().len();
+        let t0 = Instant::now();
+        while len(&path) == 0 {
+            assert!(
+                t0.elapsed() < Duration::from_secs(3),
+                "nothing written after 3 s"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(len(&path) < CHUNK as u64, "partial chunk written, unpadded");
+        drop(tx);
+        let stats = handle.join().unwrap().unwrap();
+        assert_eq!((stats.snapshots, stats.updates), (1, 10));
+        assert!(stats.partial_writes >= 1);
+        assert_eq!(
+            len(&path),
+            CHUNK as u64,
+            "padded to a whole chunk at shutdown"
+        );
+        let mut r = AlignedSbeReader::<OrderbookSchema>::open(&path).unwrap();
+        let mut n = 0;
+        while r.read_msg().unwrap().is_some() {
+            n += 1;
+        }
+        assert_eq!(n, 11);
+    }
+
+    #[test]
+    fn a_message_larger_than_a_chunk_is_rejected_and_the_writer_stays_usable() {
+        let mut w = ChunkWriter::new(Vec::new(), 256).unwrap();
+        let OutMsg::Snapshot(big) = snapshot("T", 40) else {
+            unreachable!()
+        };
+        assert!(w.write_msg(&big).is_err());
+        let OutMsg::Update(small) = update("T", 1) else {
+            unreachable!()
+        };
+        w.write_msg(&small).unwrap();
+        w.finish_chunk().unwrap();
+        assert_eq!(w.into_inner().len(), 256);
+        assert!(ChunkWriter::new(Vec::new(), 8).is_err(), "no room for data");
+    }
+
     #[test]
     fn a_killed_capture_is_readable_after_padding() {
         let dir = tempfile::tempdir().unwrap();

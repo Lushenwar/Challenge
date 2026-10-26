@@ -119,6 +119,76 @@ mod tests {
         serde_json::from_str(json).unwrap()
     }
 
+    fn page(tickers: &[&str], cursor: &str) -> (u16, String) {
+        let markets: Vec<String> = tickers
+            .iter()
+            .map(|t| format!(r#"{{"ticker":"{t}","status":"active"}}"#))
+            .collect();
+        (
+            200,
+            format!(
+                r#"{{"markets":[{}],"cursor":"{cursor}"}}"#,
+                markets.join(",")
+            ),
+        )
+    }
+
+    fn run(pages: Vec<(u16, String)>) -> (anyhow::Result<Vec<MarketInfo>>, Vec<String>) {
+        let (url, rx) = crate::exchange::stub_http::serve(pages);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+        let res = rt.block_on(discover(&client, &url));
+        (res, rx.try_iter().collect())
+    }
+
+    fn tickers(r: anyhow::Result<Vec<MarketInfo>>) -> Vec<String> {
+        r.unwrap().into_iter().map(|m| m.ticker).collect()
+    }
+
+    #[test]
+    fn follows_the_cursor_to_an_empty_one() {
+        let (res, reqs) = run(vec![page(&["A", "B"], "c1"), page(&["C"], "")]);
+        assert_eq!(tickers(res), ["A", "B", "C"]);
+        assert!(reqs[0].contains("status=open") && reqs[0].contains("mve_filter=exclude"));
+        assert!(!reqs[0].contains("cursor=") && reqs[1].contains("cursor=c1"));
+    }
+
+    /// A pass that cannot be completed must fail as a whole, or the caller would take a
+    /// partial list for the full market set and remove live markets.
+    #[test]
+    fn a_repeated_cursor_fails_the_pass() {
+        let (res, _) = run(vec![
+            page(&["A"], "c1"),
+            page(&["B"], "c1"),
+            page(&["C"], ""),
+        ]);
+        assert!(res.is_err());
+    }
+
+    #[test]
+    fn rate_limited_pages_are_retried() {
+        let (res, reqs) = run(vec![(429, "{}".into()), page(&["A"], "")]);
+        assert_eq!(tickers(res), ["A"]);
+        assert_eq!(reqs.len(), 2);
+    }
+
+    #[test]
+    fn a_client_error_fails_the_pass_without_retrying() {
+        let (res, reqs) = run(vec![
+            page(&["A"], "c1"),
+            (404, "{}".into()),
+            page(&["B"], ""),
+        ]);
+        assert!(res.is_err());
+        assert_eq!(reqs.len(), 2);
+    }
+
     #[test]
     fn keeps_live_binary_markets_and_drops_mve() {
         let m = raw(

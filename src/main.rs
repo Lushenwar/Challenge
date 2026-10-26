@@ -166,3 +166,37 @@ impl Signals {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_the_drop_hook() {
+        assert_eq!(parse_drop("3@60"), Ok((3, Duration::from_secs(60))));
+        for bad in ["3", "x@1", "3@", "@5", "3@-1"] {
+            assert!(parse_drop(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn the_command_line_is_valid() {
+        use clap::CommandFactory;
+        Args::command().debug_assert(); // the clap self-check that once panicked at startup
+        let a = Args::try_parse_from([
+            "c",
+            "--race",
+            "3",
+            "--source-port-base",
+            "40000",
+            "--drop-conn",
+            "1@5",
+        ])
+        .unwrap();
+        assert_eq!(
+            (a.race, a.source_port_base, a.drop_conn),
+            (3, Some(40000), Some((1, Duration::from_secs(5))))
+        );
+        assert_eq!(a.output, PathBuf::from("/dev/stdout"), "stdout by default");
+    }
+}

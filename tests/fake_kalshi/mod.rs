@@ -51,6 +51,8 @@ pub enum Fault {
     Add(String),
     /// Close a market: lifecycle `determined`, gone from REST, no more events.
     Remove(String),
+    /// Drop a market from REST only (no lifecycle event), and stop its events.
+    Delist(String),
     /// Stop / restart generating events.
     Pause(bool),
 }
@@ -302,6 +304,11 @@ impl Core {
                 self.listing
                     .send_replace(self.live.iter().cloned().collect());
                 self.lifecycle(&m, "determined");
+            }
+            Fault::Delist(m) => {
+                self.live.remove(&m);
+                self.listing
+                    .send_replace(self.live.iter().cloned().collect());
             }
             Fault::Pause(p) => self.paused = p,
         }

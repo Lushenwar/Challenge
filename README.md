@@ -216,9 +216,22 @@ cargo clippy --all-targets -- -D warnings
 cargo test --all-targets
 ```
 
+122 tests (2 more with `--ignored`: the 5,000-market scale run and the live recorder).
+
 - Unit tests (fixed-point parsing incl. property tests, order book, codecs, connection
-  state machine, planner, arbiter failover / removal / health rules) are pure: no network,
-  injected time.
+  state machine for both venues, planner, arbiter failover / removal / health rules,
+  discovery paging and the removal rule, the writer, `verify`'s checks) are pure: no
+  network, injected time. Property tests: the arbiter keeps the written book equal to the
+  true book through random interleavings of updates, disconnects, invalidations and
+  resubscribes across three sources; the planner keeps replicas distinct, sockets within
+  capacity and live markets in place under random adds and removes; our chunk writer is
+  byte-identical to the starter writer.
+- `tests/e2e_fake_kalshi.rs` runs the real binary against a local fake Kalshi that keeps
+  the true book of every market, and checks every written snapshot and update against
+  it: steady state, one socket lost, both lost (a reported gap), markets added, removed by
+  lifecycle and delisted silently, a silent subscription, a seq gap, a slow socket,
+  repeated drops, a single replica, SIGINT's final snapshots, and (ignored) 5,000 markets
+  on 20+ sockets.
 - `tests/replay_kalshi.rs` replays a committed 1 MB live recording
   (`fixtures/kalshi/prod-2026-10-24.jsonl`) through the decoder and books; every
   mid-stream exchange snapshot must equal the rebuilt book.

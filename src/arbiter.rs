@@ -789,6 +789,132 @@ mod tests {
         }
     }
 
+    fn snap_of(conn: ConnId, market: &str, bid: i64, exch_us: i64, cause: SnapCause) -> ConnEvent {
+        ConnEvent::Snapshot {
+            conn,
+            market: market.into(),
+            book: book(bid),
+            recv_us: exch_us,
+            exch_us,
+            cause,
+        }
+    }
+
+    #[test]
+    fn minute_snapshots_cover_live_markets_with_a_valid_source_only() {
+        let mut a = Arbiter::default();
+        let mut out = Vec::new();
+        for m in ["B", "A", "GAP", "GONE"] {
+            a.on_event(snap_of(0, m, 400_000, 1, SnapCause::Subscribed), &mut out);
+        }
+        a.on_event(ConnEvent::Disconnected { conn: 0 }, &mut out); // every market in a gap
+        for m in ["B", "A", "GONE"] {
+            a.on_event(snap_of(1, m, 400_000, 2, SnapCause::Subscribed), &mut out);
+        }
+        a.on_event(
+            ConnEvent::Removed {
+                conn: 1,
+                market: "GONE".into(),
+            },
+            &mut out,
+        );
+        out.clear();
+        a.snapshot_all(60_000_000, SnapCause::Periodic, &mut out);
+        let symbols: Vec<&str> = out
+            .iter()
+            .map(|m| match m {
+                OutMsg::Snapshot(s) => {
+                    assert_eq!(s.received_at, ts(60_000_000), "stamped at the round");
+                    s.symbol.as_str()
+                }
+                OutMsg::Update(_) => panic!("only snapshots"),
+            })
+            .collect();
+        assert_eq!(
+            symbols,
+            ["A", "B"],
+            "sorted; no gap market, no removed market"
+        );
+    }
+
+    #[test]
+    fn lifecycle_events_go_to_control() {
+        use crate::exchange::Lifecycle;
+        let mut a = Arbiter::default();
+        let mut out = Vec::new();
+        let ev = ConnEvent::Lifecycle {
+            conn: 0,
+            market: "T".into(),
+            event: Lifecycle::Determined,
+        };
+        a.on_event(ev, &mut out);
+        assert!(out.is_empty());
+        assert_eq!(
+            a.control,
+            vec![ControlMsg::Lifecycle("T".into(), Lifecycle::Determined)]
+        );
+        assert_eq!(a.stats.lifecycle_events, 1);
+    }
+
+    #[test]
+    fn an_exchange_reset_on_the_active_source_is_written() {
+        let mut a = Arbiter::default();
+        let mut out = Vec::new();
+        a.on_event(snap(0, 400_000, 1), &mut out);
+        a.on_event(snap(1, 400_000, 1), &mut out);
+        out.clear();
+        a.on_event(snap_of(1, "T", 300_000, 5, SnapCause::Exchange), &mut out); // backup: silent
+        assert!(out.is_empty());
+        a.on_event(snap_of(0, "T", 300_000, 6, SnapCause::Exchange), &mut out);
+        assert_eq!(bids(&out[0]), vec![(300_000, 5)]);
+    }
+
+    #[test]
+    fn losing_a_backup_changes_nothing_in_the_output() {
+        let mut a = Arbiter::default();
+        let mut out = Vec::new();
+        a.on_event(snap(0, 400_000, 1), &mut out);
+        a.on_event(snap(1, 400_000, 1), &mut out);
+        out.clear();
+        a.on_event(
+            ConnEvent::Invalidated {
+                conn: 1,
+                market: "T".into(),
+            },
+            &mut out,
+        );
+        a.on_event(ConnEvent::Disconnected { conn: 1 }, &mut out);
+        assert!(out.is_empty());
+        a.on_event(update(0, 8, 2), &mut out);
+        assert!(matches!(&out[..], [OutMsg::Update(u)] if u.quantity == 8));
+        assert_eq!((a.stats.failovers, a.stats.gaps), (0, 0));
+    }
+
+    /// `FASTER_MIN_WINS` and `FASTER_PCT` at their edges: 19 wins out of 19 is too few
+    /// to act on; 20 wins at exactly 80% of the contested updates is enough.
+    #[test]
+    fn the_faster_replica_rule_needs_enough_wins_and_share() {
+        let race = |wins: i64, losses: i64| {
+            let mut a = Arbiter::default();
+            let mut out = Vec::new();
+            a.on_event(snap(0, 400_000, 1), &mut out); // conn 0 active
+            a.on_event(snap(1, 400_000, 1), &mut out);
+            for i in 0..wins + losses {
+                let t = 1_000 + i * 1_000;
+                let (first, second) = if i < wins { (1, 0) } else { (0, 1) };
+                a.on_event(update(first, i + 1, t), &mut out);
+                a.on_event(update(second, i + 1, t), &mut out);
+            }
+            a.prefer_faster(&mut out);
+            a.stats.switches_faster
+        };
+        assert_eq!(health::FASTER_MIN_WINS, 20);
+        assert_eq!(health::FASTER_PCT, 80);
+        assert_eq!(race(19, 0), 0, "19 wins: not enough evidence");
+        assert_eq!(race(20, 5), 1, "20 of 25 = 80%");
+        assert_eq!(race(20, 6), 0, "20 of 26 < 80%");
+    }
+
     #[test]
     fn forwards_only_the_active_source() {
         let mut a = Arbiter::default();

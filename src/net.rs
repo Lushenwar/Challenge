@@ -205,6 +205,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_ip_override_skips_dns() {
+        let (url, _) = server().await;
+        let port = url.rsplit(':').next().unwrap();
+        // A host that cannot resolve: only the override can reach the server.
+        let req = format!("ws://does-not-resolve.invalid:{port}")
+            .into_client_request()
+            .unwrap();
+        let opts = NetOpts {
+            ip: Some("127.0.0.1".parse().unwrap()),
+            ..NetOpts::default()
+        };
+        let (_, peer) = connect(req, &opts, 0).await.unwrap();
+        assert_eq!(peer.to_string(), format!("127.0.0.1:{port}"));
+    }
+
+    #[tokio::test]
     async fn racing_opens_several_and_keeps_one() {
         let (url, accepted) = server().await;
         let opts = NetOpts {

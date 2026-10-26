@@ -79,6 +79,15 @@ mod tests {
     }
 
     #[test]
+    fn formats_six_fractional_digits() {
+        assert_eq!(format_fixed(450_000), "0.450000");
+        assert_eq!(format_fixed(-1), "-0.000001");
+        assert_eq!(format_fixed(0), "0.000000");
+        assert_eq!(format_fixed(26_794_950_000), "26794.950000");
+        assert_eq!(format_fixed(i64::MIN + 1), "-9223372036854.775807");
+    }
+
+    #[test]
     fn rejects_malformed() {
         for (s, e) in [
             ("", FixedError::Empty),

@@ -421,37 +421,6 @@ mod tests {
         assert!(closed.into_books().is_empty());
     }
 
-    /// Serves `pages[i]` (status, body) to the i-th request and records each request line.
-    fn gamma(pages: Vec<(u16, String)>) -> (String, std::sync::mpsc::Receiver<String>) {
-        use std::io::{BufRead, BufReader, Write};
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let url = format!("http://{}", listener.local_addr().unwrap());
-        let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            for ((status, body), stream) in pages.into_iter().zip(listener.incoming()) {
-                let mut stream = stream.unwrap();
-                let mut line = String::new();
-                let mut reader = BufReader::new(stream.try_clone().unwrap());
-                reader.read_line(&mut line).unwrap();
-                loop {
-                    let mut h = String::new();
-                    reader.read_line(&mut h).unwrap();
-                    if h == "\r\n" || h.is_empty() {
-                        break;
-                    }
-                }
-                tx.send(line).unwrap();
-                write!(
-                    stream,
-                    "HTTP/1.1 {status} X\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
-                    body.len()
-                )
-                .unwrap();
-            }
-        });
-        (url, rx)
-    }
-
     fn page(tokens: &[&str], next: Option<&str>) -> (u16, String) {
         let markets: Vec<String> = tokens
             .iter()
@@ -468,7 +437,7 @@ mod tests {
     }
 
     fn run(pages: Vec<(u16, String)>) -> (anyhow::Result<Vec<MarketInfo>>, Vec<String>) {
-        let (url, rx) = gamma(pages);
+        let (url, rx) = crate::exchange::stub_http::serve(pages);
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -496,7 +465,8 @@ mod tests {
 
     #[test]
     fn live_markets_runs_the_complete_listing_in_the_background() {
-        let (url, _requests) = gamma(vec![page(&["A"], Some("c1")), page(&["B"], None)]);
+        let (url, _requests) =
+            crate::exchange::stub_http::serve(vec![page(&["A"], Some("c1")), page(&["B"], None)]);
         let rt = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
@@ -531,6 +501,27 @@ mod tests {
         assert!(res.is_err(), "a failed page fails the pass");
         let (res, _) = run(vec![page(&["A"], Some("c1")), page(&["B"], Some("c1"))]);
         assert!(res.is_err(), "a repeated cursor fails the pass");
+    }
+
+    #[test]
+    fn subscriptions_are_batched() {
+        let mut s = PolySession {
+            initial_sent: false,
+        };
+        let ms: Vec<String> = (0..2 * BATCH + 1).map(|i| format!("T{i}")).collect();
+        let cmds = s.on_connect(&ms);
+        assert_eq!(cmds.len(), 3);
+        assert!(
+            cmds[0].contains(r#""type":"market""#),
+            "the first message opens the channel"
+        );
+        assert!(
+            cmds[1..]
+                .iter()
+                .all(|c| c.contains(r#""operation":"subscribe""#))
+        );
+        // A reconnect starts over with `type: market`.
+        assert!(s.on_connect(&ms[..1])[0].contains(r#""type":"market""#));
     }
 
     #[test]

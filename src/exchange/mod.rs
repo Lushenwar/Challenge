@@ -5,6 +5,8 @@
 
 pub mod kalshi;
 pub mod polymarket;
+#[cfg(test)]
+pub(crate) mod stub_http;
 
 use std::{path::PathBuf, sync::Arc};
 
