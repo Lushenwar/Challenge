@@ -34,6 +34,10 @@ struct RawMarket {
     mve_selected_legs: Option<Value>,
     #[serde(default)]
     volume_24h_fp: String,
+    #[serde(default)]
+    price_level_structure: Option<String>,
+    #[serde(default)]
+    price_ranges: Option<Value>,
 }
 
 impl RawMarket {
@@ -44,7 +48,16 @@ impl RawMarket {
                 .mve_selected_legs
                 .is_some_and(|l| !l.is_null() && l.as_array().is_none_or(|a| !a.is_empty()));
         let live = matches!(self.status.as_str(), "open" | "active");
+        let meta =
+            (self.price_level_structure.is_some() || self.price_ranges.is_some()).then(|| {
+                serde_json::json!({
+                    "price_level_structure": self.price_level_structure,
+                    "price_ranges": self.price_ranges,
+                })
+                .to_string()
+            });
         (live && !is_mve).then(|| MarketInfo {
+            meta,
             volume_24h: self
                 .volume_24h_fp
                 .split('.')
@@ -198,7 +211,8 @@ mod tests {
             m.into_market(),
             Some(MarketInfo {
                 ticker: "A".into(),
-                volume_24h: 12
+                volume_24h: 12,
+                meta: None,
             })
         );
         for j in [
@@ -213,5 +227,11 @@ mod tests {
             r#"{"ticker":"F","status":"open","mve_collection_ticker":"","mve_selected_legs":[]}"#,
         );
         assert!(empty_legs.into_market().is_some());
+        let tick = raw(
+            r#"{"ticker":"G","status":"active","price_level_structure":"linear_cent","price_ranges":[{"start":"0.0000","end":"1.0000","step":"0.0100"}]}"#,
+        );
+        let meta: Value = serde_json::from_str(&tick.into_market().unwrap().meta.unwrap()).unwrap();
+        assert_eq!(meta["price_level_structure"], "linear_cent");
+        assert_eq!(meta["price_ranges"][0]["step"], "0.0100");
     }
 }

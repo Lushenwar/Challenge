@@ -489,6 +489,18 @@ impl Arbiter {
     }
 
     /// A snapshot of every market that currently has a valid active source.
+    /// (markets collected, of which in a gap right now), for metrics.
+    // ponytail: a scan of every market 4x a second, only with --metrics-listen.
+    pub fn live_counts(&self) -> (u64, u64) {
+        let live = self.markets.values().filter(|m| !m.removed);
+        let (mut n, mut gap) = (0, 0);
+        for m in live {
+            n += 1;
+            gap += m.gap_since.is_some() as u64;
+        }
+        (n, gap)
+    }
+
     pub fn snapshot_all(&mut self, now_us: i64, cause: SnapCause, out: &mut Vec<OutMsg>) {
         let mut markets: Vec<_> = self
             .markets
@@ -587,6 +599,7 @@ pub async fn run(
     mut events: mpsc::Receiver<ConnEvent>,
     writer: Sender<OutMsg>,
     control: mpsc::UnboundedSender<ControlMsg>,
+    view: Option<tokio::sync::watch::Sender<crate::metrics::ArbiterView>>,
 ) -> ArbiterStats {
     let mut a = Arbiter::default();
     let mut buf = Vec::new();
@@ -607,7 +620,18 @@ pub async fn run(
                 a.prefer_faster(&mut buf);
                 minute.as_mut().reset(tokio::time::Instant::now() + until_next_minute());
             }
-            _ = tick.tick() => a.on_tick(now_us(), &mut buf),
+            _ = tick.tick() => {
+                a.on_tick(now_us(), &mut buf);
+                if let Some(v) = &view {
+                    let (markets_live, markets_in_gap) = a.live_counts();
+                    v.send_replace(crate::metrics::ArbiterView {
+                        stats: a.stats.clone(),
+                        markets_live,
+                        markets_in_gap,
+                        writer_queue: writer.len(),
+                    });
+                }
+            }
         }
         for (market, cause, at) in a.snapshot_log.drain(..) {
             log_snapshot(&market, cause, at);

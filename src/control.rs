@@ -40,6 +40,10 @@ pub struct Config {
     pub discovery_every: Duration,
     /// Cap on collected markets (testing); `None` = every live market.
     pub max_markets: Option<usize>,
+    /// `--metadata`: append a JSON line per collected market when its metadata changes.
+    pub metadata: Option<std::fs::File>,
+    /// `--metrics-listen`: each new connection's stats channel goes here.
+    pub metrics: Option<mpsc::UnboundedSender<watch::Receiver<ConnStats>>>,
     pub net: crate::net::NetOpts,
 }
 
@@ -63,6 +67,7 @@ struct Control {
     events: mpsc::Sender<ConnEvent>,
     stop: watch::Receiver<bool>,
     stats: ControlStats,
+    metadata: Metadata,
 }
 
 /// Runs until `stop` flips, then waits for every connection to close and returns the
@@ -84,8 +89,12 @@ pub async fn run(
         events,
         stop: stop.clone(),
         stats: ControlStats::default(),
+        metadata: Metadata::default(),
     };
+    c.metadata.out = c.cfg.metadata.take();
+    let metas = c.metadata.pairs(&initial);
     c.add(initial).await;
+    c.record_metadata(metas);
     let mut stop = stop;
     let mut pass: Option<JoinHandle<anyhow::Result<Vec<MarketInfo>>>> = None;
     let next = tokio::time::sleep(c.cfg.discovery_every);
@@ -183,6 +192,41 @@ fn count_misses<'a>(
     gone
 }
 
+/// `--metadata`: the last metadata written per market, and the file.
+#[derive(Default)]
+struct Metadata {
+    out: Option<std::fs::File>,
+    seen: HashMap<String, String>,
+}
+
+impl Metadata {
+    /// `(ticker, metadata)` of the markets that carry some, if a file is configured.
+    fn pairs(&self, markets: &[MarketInfo]) -> Vec<(String, String)> {
+        if self.out.is_none() {
+            return Vec::new();
+        }
+        markets
+            .iter()
+            .filter_map(|m| Some((m.ticker.clone(), m.meta.clone()?)))
+            .collect()
+    }
+
+    /// JSON lines for the markets whose metadata is new or changed (and remember it).
+    fn changed(&mut self, pairs: Vec<(String, String)>, at_us: i64) -> Vec<String> {
+        let mut lines = Vec::new();
+        for (ticker, meta) in pairs {
+            if self.seen.get(&ticker) != Some(&meta) {
+                lines.push(format!(
+                    r#"{{"ticker":{},"at_us":{at_us},"meta":{meta}}}"#,
+                    serde_json::json!(ticker)
+                ));
+                self.seen.insert(ticker, meta);
+            }
+        }
+        lines
+    }
+}
+
 /// Discovered markets to start collecting: not collected yet and not recently removed.
 fn addable(
     markets: Vec<MarketInfo>,
@@ -196,6 +240,22 @@ fn addable(
 }
 
 impl Control {
+    /// Append metadata lines for the collected markets among `pairs`.
+    // ponytail: a blocking file write on the control task; it is a few lines per pass.
+    fn record_metadata(&mut self, pairs: Vec<(String, String)>) {
+        let pairs = pairs
+            .into_iter()
+            .filter(|(t, _)| self.planner.contains(t))
+            .collect();
+        let lines = self.metadata.changed(pairs, crate::model::now_us());
+        if let (Some(out), false) = (self.metadata.out.as_mut(), lines.is_empty()) {
+            use std::io::Write;
+            if let Err(e) = out.write_all((lines.join("\n") + "\n").as_bytes()) {
+                tracing::warn!(error = %e, "writing --metadata failed");
+            }
+        }
+    }
+
     async fn reconcile(&mut self, markets: Vec<MarketInfo>) {
         self.stats.discovery_passes += 1;
         // The set removals are judged against: this pass if it lists every live market,
@@ -212,8 +272,10 @@ impl Control {
             self.remove(&gone);
         }
         self.tombstones.retain(|_, t| t.elapsed() < TOMBSTONE);
+        let metas = self.metadata.pairs(&markets);
         let new = addable(markets, |t| self.planner.contains(t), &self.tombstones);
         self.add(new).await;
+        self.record_metadata(metas);
     }
 
     async fn add(&mut self, mut markets: Vec<MarketInfo>) {
@@ -261,6 +323,11 @@ impl Control {
             // Two connections carry the (market-global) lifecycle feed, for redundancy.
             lifecycle: conn < 2,
             net: self.cfg.net.clone(),
+            stats_out: self.cfg.metrics.as_ref().map(|m| {
+                let (tx, rx) = watch::channel(ConnStats::default());
+                let _ = m.send(rx);
+                tx
+            }),
         };
         self.handles.push(tokio::spawn(conn::run(
             spec,
@@ -319,8 +386,28 @@ mod tests {
     }
 
     #[test]
+    fn metadata_lines_only_when_new_or_changed() {
+        let mut md = Metadata::default();
+        let p = |t: &str, m: &str| (t.to_owned(), m.to_owned());
+        let first = md.changed(vec![p("A", r#"{"tick":1}"#), p("B", r#"{"tick":1}"#)], 5);
+        assert_eq!(first.len(), 2);
+        let line: serde_json::Value = serde_json::from_str(&first[0]).unwrap();
+        assert_eq!(line["ticker"], "A");
+        assert_eq!(line["at_us"], 5);
+        assert_eq!(line["meta"]["tick"], 1);
+        let again = md.changed(vec![p("A", r#"{"tick":1}"#), p("B", r#"{"tick":2}"#)], 6);
+        assert_eq!(again.len(), 1, "only B changed");
+        assert!(again[0].contains(r#""tick":2"#));
+        assert!(
+            md.pairs(&[]).is_empty(),
+            "no file configured: nothing collected"
+        );
+    }
+
+    #[test]
     fn recently_removed_and_collected_markets_are_not_added() {
         let m = |t: &str| MarketInfo {
+            meta: None,
             ticker: t.into(),
             volume_24h: 0,
         };

@@ -46,7 +46,13 @@ fn key_file(dir: &Path) -> PathBuf {
     path
 }
 
-fn start(fake: &Fake, dir: &Path, markets_per_socket: usize, replicas: usize) -> Child {
+fn start(
+    fake: &Fake,
+    dir: &Path,
+    markets_per_socket: usize,
+    replicas: usize,
+    extra: &[String],
+) -> Child {
     let log = std::fs::File::create(dir.join("collector.log")).unwrap();
     Command::new(env!("CARGO_BIN_EXE_engineering-challenge"))
         .args([
@@ -65,6 +71,9 @@ fn start(fake: &Fake, dir: &Path, markets_per_socket: usize, replicas: usize) ->
         .arg(dir.join("cap.sbe"))
         .arg("--report")
         .arg(dir.join("report.json"))
+        .arg("--metadata")
+        .arg(dir.join("meta.jsonl"))
+        .args(extra)
         .stdout(Stdio::null())
         .stderr(log)
         .spawn()
@@ -79,7 +88,7 @@ async fn run(
     total: Duration,
     faults: Vec<(Duration, Fault)>,
 ) -> Run {
-    run_with(fake, markets_per_socket, 2, total, faults).await
+    run_with(fake, markets_per_socket, 2, total, faults, &[]).await
 }
 
 async fn run_with(
@@ -88,9 +97,10 @@ async fn run_with(
     replicas: usize,
     total: Duration,
     faults: Vec<(Duration, Fault)>,
+    extra: &[String],
 ) -> Run {
     let dir = tempfile::tempdir().unwrap();
-    let mut child = start(&fake, dir.path(), markets_per_socket, replicas);
+    let mut child = start(&fake, dir.path(), markets_per_socket, replicas, extra);
     let t0 = tokio::time::Instant::now();
     for (at, f) in faults {
         tokio::time::sleep_until(t0 + at).await;
@@ -322,6 +332,11 @@ async fn steady_state() {
     let c = assert_true_to_the_exchange(&run, 20);
     assert!(c.updates > 1000, "{c:?}");
     assert_eq!(arbiter(&run, "gaps"), 0);
+    // --metadata: one line per collected market (its metadata never changed).
+    let meta = std::fs::read_to_string(run.cap.with_file_name("meta.jsonl")).unwrap();
+    assert_eq!(meta.lines().count(), 20, "{meta}");
+    let line: Value = serde_json::from_str(meta.lines().next().unwrap()).unwrap();
+    assert_eq!(line["meta"]["price_level_structure"], "linear_cent");
     // The checker must catch a capture that disagrees with the exchange: alter one
     // mid-run event of the true history and check the same capture again.
     let mut wrong = Run {
@@ -491,6 +506,57 @@ async fn sigint_ends_every_market_with_a_final_snapshot() {
     assert!(run.report["writer"]["snapshots"].as_u64().unwrap() >= 40);
 }
 
+/// `--metrics-listen`: Prometheus text and the health check answer while collecting.
+#[tokio::test(flavor = "multi_thread")]
+async fn metrics_and_healthz_while_collecting() {
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let base = format!("http://127.0.0.1:{port}");
+    let get = |path: &str| {
+        let url = format!("{base}{path}");
+        async move {
+            let r = reqwest::get(url).await.unwrap();
+            (r.status().as_u16(), r.text().await.unwrap())
+        }
+    };
+    let probe = async {
+        tokio::time::sleep(S(5)).await;
+        (
+            get("/metrics").await,
+            get("/healthz").await,
+            get("/nope").await,
+        )
+    };
+    let extra = vec!["--metrics-listen".to_owned(), format!("127.0.0.1:{port}")];
+    let fake = Fake::start(20, 300, 13).await;
+    let (run, ((ms, metrics), (hs, health), (ns, _))) =
+        tokio::join!(run_with(fake, 5000, 2, S(8), vec![], &extra), probe);
+    assert_true_to_the_exchange(&run, 20);
+    assert_eq!(ms, 200);
+    for line in [
+        "collector_markets_live 20",
+        "collector_markets_in_gap 0",
+        "collector_socket_connected{socket=\"0\"} 1",
+    ] {
+        assert!(
+            metrics.lines().any(|l| l == line),
+            "missing {line:?} in\n{metrics}"
+        );
+    }
+    let updates: u64 = metrics
+        .lines()
+        .find_map(|l| l.strip_prefix("collector_updates_written_total "))
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!(updates > 0);
+    assert_eq!((hs, health.as_str()), (200, "ok\n"));
+    assert_eq!(ns, 404);
+}
+
 /// No lifecycle event: the market just stops being listed. Two complete discovery
 /// passes without it remove it (empty terminal snapshot); one pass is not enough.
 #[tokio::test(flavor = "multi_thread")]
@@ -543,6 +609,7 @@ async fn a_single_replica_loss_is_a_reported_gap() {
         1,
         S(10),
         vec![(S(4), Fault::Drop(0))],
+        &[],
     )
     .await;
     let c = check(&run);

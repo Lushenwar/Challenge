@@ -1,0 +1,14 @@
+# engineering-challenge --config collector.example.toml
+# Keys are the command-line flag names (underscores or dashes). Precedence:
+# defaults < this file < environment (KALSHI_API_KEY_ID, KALSHI_PRIVATE_KEY_PATH) < flags.
+# `--print-config` shows the result.
+
+exchange = "kalshi"              # or "polymarket"
+# key_path = "/home/me/.kalshi/key.pem"   # usually from KALSHI_PRIVATE_KEY_PATH
+markets_per_socket = 5000
+replicas = 2                     # sockets per market; failover needs at least 2
+discovery_secs = 30
+output = "/dev/stdout"
+# report = "report.json"
+# metadata = "markets.jsonl"     # tick size / price ranges per market, on change
+# max_markets = 50               # testing: only the 50 most active markets

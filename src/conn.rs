@@ -33,6 +33,8 @@ const SILENT_FOR: Duration = Duration::from_secs(20);
 
 #[derive(Debug, Default, Clone, Serialize)]
 pub struct ConnStats {
+    /// Connected right now (for `--metrics-listen`; false in the final report).
+    pub connected: bool,
     pub connects: u64,
     pub frames: u64,
     pub snapshots: u64,
@@ -96,6 +98,7 @@ impl ConnState {
     pub fn subscribe_cmds(&mut self) -> Vec<String> {
         self.next_seq.clear();
         self.connected = true;
+        self.stats.connected = true;
         self.markets
             .values_mut()
             .for_each(|m| *m = Market::default());
@@ -106,6 +109,7 @@ impl ConnState {
 
     pub fn disconnected(&mut self) {
         self.connected = false;
+        self.stats.connected = false;
     }
 
     pub fn keepalive(&self) -> Message {
@@ -444,6 +448,8 @@ pub struct Spec {
     pub tickers: Vec<String>,
     pub lifecycle: bool,
     pub net: crate::net::NetOpts,
+    /// `--metrics-listen`: publish this connection's stats here.
+    pub stats_out: Option<watch::Sender<ConnStats>>,
 }
 
 /// The socket loop. Returns when `stop` flips, after sending a close frame.
@@ -460,7 +466,13 @@ pub async fn run(
         tickers,
         lifecycle,
         net,
+        stats_out,
     } = spec;
+    let publish = |s: &ConnStats| {
+        if let Some(tx) = &stats_out {
+            tx.send_replace(s.clone());
+        }
+    };
     let mut st = ConnState::new(conn, &tickers, exchange.session(lifecycle));
     let mut backoff = Duration::from_secs(1);
     while !*stop.borrow() {
@@ -508,6 +520,7 @@ pub async fn run(
         for cmd in st.subscribe_cmds() {
             ok &= ws.send(Message::text(cmd)).await.is_ok();
         }
+        publish(&st.stats);
         let mut ping = tokio::time::interval(PING_EVERY);
         let mut last_rx = tokio::time::Instant::now();
         while ok {
@@ -532,6 +545,7 @@ pub async fn run(
                     }
                 }
                 _ = ping.tick() => {
+                    publish(&st.stats);
                     if last_rx.elapsed() > SILENT_FOR {
                         st.stats.stalls += 1;
                         tracing::warn!(conn, "nothing received for {SILENT_FOR:?}; reconnecting");
@@ -564,6 +578,7 @@ pub async fn run(
             }
         }
         st.disconnected();
+        publish(&st.stats);
         if events.send(ConnEvent::Disconnected { conn }).await.is_err() {
             break;
         }

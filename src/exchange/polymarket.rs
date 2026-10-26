@@ -173,6 +173,10 @@ struct RawMarket {
     accepting_orders: Option<bool>,
     #[serde(default)]
     volume24hr: Option<serde_json::Number>,
+    #[serde(default)]
+    order_price_min_tick_size: Option<serde_json::Number>,
+    #[serde(default)]
+    order_min_size: Option<serde_json::Number>,
 }
 
 impl RawMarket {
@@ -191,9 +195,18 @@ impl RawMarket {
             .map(|n| n.to_string())
             .and_then(|s| s.split('.').next().and_then(|w| w.parse().ok()))
             .unwrap_or(0);
+        let meta = (self.order_price_min_tick_size.is_some() || self.order_min_size.is_some())
+            .then(|| {
+                json!({"tick_size": self.order_price_min_tick_size, "min_size": self.order_min_size})
+                    .to_string()
+            });
         tokens
             .into_iter()
-            .map(|ticker| MarketInfo { ticker, volume_24h })
+            .map(|ticker| MarketInfo {
+                ticker,
+                volume_24h,
+                meta: meta.clone(),
+            })
             .collect()
     }
 }
@@ -404,7 +417,7 @@ mod tests {
     #[test]
     fn discovery_expands_tradeable_markets_into_token_books() {
         let raw: RawMarket = serde_json::from_str(
-            r#"{"clobTokenIds":"[\"T1\",\"T2\"]","enableOrderBook":true,"acceptingOrders":true,"volume24hr":1234.56}"#,
+            r#"{"clobTokenIds":"[\"T1\",\"T2\"]","enableOrderBook":true,"acceptingOrders":true,"volume24hr":1234.56,"orderPriceMinTickSize":0.001,"orderMinSize":5}"#,
         )
         .unwrap();
         let books = raw.into_books();
@@ -413,7 +426,8 @@ mod tests {
             books[0],
             MarketInfo {
                 ticker: "T1".into(),
-                volume_24h: 1234
+                volume_24h: 1234,
+                meta: Some(r#"{"min_size":5,"tick_size":0.001}"#.into()),
             }
         );
         let closed: RawMarket =

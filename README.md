@@ -188,6 +188,7 @@ markets; the per-market fault rate is unchanged.
 |---|---|
 | `engineering-challenge` | the collector |
 | `verify <capture> --events <stderr log>` | decodes the capture with the starter reader, rebuilds every book from the updates, and requires every later snapshot to match. A mismatch is accepted only when the collector logged a non-periodic cause for that snapshot (subscribe, resync, failover, exchange reset, removal). Also: no update before a symbol's first snapshot, ≤ 61 s between a live symbol's snapshots (longer only inside a logged gap), timestamp regressions reported. JSON summary; exit 0 only if nothing is unexplained. |
+| `inspect <capture> [--repair]` | JSON summary of a capture: message counts, symbols, time range, snapshots / updates per symbol, busiest symbols, chunks, payload vs padding bytes, and any cut-off tail the starter reader cannot see (`--repair` pads it) |
 | `record --markets N --conns M --minutes T --out f.jsonl` | raw frame recorder: one JSON line per websocket frame with its local receive time; the source of the test fixtures and the latency lab |
 | `faultproxy --log faults.jsonl` | websocket proxy the collector connects to (`--ws-url ws://127.0.0.1:9000`); injects connection drops, single-frame drops, delays and silent subscriptions (with `seq` renumbered so no gap shows) and logs each one |
 
@@ -205,7 +206,14 @@ markets; the per-market fault rate is unchanged.
 | `--output PATH` | `/dev/stdout` | |
 | `--report PATH` | none | also write the final JSON report here |
 | `--ws-url URL` | venue's | connect elsewhere (the fault proxy) |
+| `--rest-url URL` | venue's | discovery REST base (tests, fake exchanges) |
+| `--metadata PATH` | none | append a JSON line per collected market (Kalshi `price_level_structure` / `price_ranges`, Polymarket tick and minimum size) when it first appears or changes |
+| `--metrics-listen ADDR` | off | Prometheus text at `/metrics` (markets live / in a gap, writer queue, updates and snapshots written, failovers by reason, gaps, resubscribes, recycles; per socket: connected, connects, stalls, seq gaps, frames) and `/healthz` (200 while at most 1% of markets are in a gap, else 503) |
+| `--race N` | 1 | race N handshakes per connect, keep the first (measured: no gain, see latency.md) |
+| `--source-port-base P` | none | pin each socket's local port (falls back if taken) |
 | `--drop-conn N@S` | none | test hook: drop socket N after S seconds |
+| `--config FILE` | none | TOML settings keyed by flag name (see `collector.example.toml`); precedence defaults < file < environment < command line; unknown keys are an error |
+| `--print-config` | | print the effective settings to stderr and exit |
 
 `RUST_LOG` controls stderr verbosity (default `info`).
 
@@ -217,7 +225,7 @@ cargo clippy --all-targets -- -D warnings
 cargo test --all-targets
 ```
 
-122 tests (2 more with `--ignored`: the 5,000-market scale run and the live recorder).
+130 tests (2 more with `--ignored`: the 5,000-market scale run and the live recorder).
 
 - Unit tests (fixed-point parsing incl. property tests, order book, codecs, connection
   state machine for both venues, planner, arbiter failover / removal / health rules,
@@ -297,15 +305,20 @@ src/arbiter.rs        source selection, failover, snapshots, health actions
 src/health.rs         rate EWMA, recycle schedule, thresholds
 src/planner.rs        market → socket placement
 src/control.rs        discovery loop, lifecycle, connection tasks
-src/writer.rs         SBE writer thread
+src/writer.rs         SBE writer thread (starter chunk format, written within ~1 s)
+src/net.rs            socket opening: TCP_NODELAY, racing, source ports
+src/metrics.rs        --metrics-listen: /metrics and /healthz
 src/book.rs, fixed.rs order book; exact decimals
 src/exchange/         venue layer: mod.rs (traits), kalshi/, polymarket.rs
-src/bin/              verify, record, faultproxy
+src/bin/              verify, inspect, record, faultproxy
 src/util/, sbe_schemas/, src/side.rs   supplied starter code, unmodified
-tests/                replay and integration tests
+tests/                replay, integration and end-to-end tests (fake_kalshi/: a
+                      local exchange that knows the true book)
 fixtures/kalshi/      a 1 MB live prod recording
-scripts/latency.py    latency analysis
+scripts/              latency.py, ports_compare.py: latency analysis
+collector.example.toml  example --config file
 docs/latency.md       latency findings (Extension 4)
+docs/requirement-test-matrix.md, docs/evidence/   requirement → evidence, run summaries
 ```
 
 The SBE schema and helpers (`src/util/`, `sbe_schemas/`) are the challenge's supplied

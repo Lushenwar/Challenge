@@ -22,6 +22,8 @@ pub struct MarketInfo {
     pub ticker: String,
     /// Whole contracts/shares traded in the last 24h; for ranking only.
     pub volume_24h: u64,
+    /// Venue market metadata (tick size / price ranges) as compact JSON, for `--metadata`.
+    pub meta: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

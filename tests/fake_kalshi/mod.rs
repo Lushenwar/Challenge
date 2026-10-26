@@ -578,7 +578,11 @@ fn serve_rest(listener: std::net::TcpListener, listing: watch::Receiver<Vec<Stri
         let markets: Vec<Value> = listing
             .borrow()
             .iter()
-            .map(|t| json!({"ticker": t, "status": "active", "volume_24h_fp": "100.00"}))
+            .map(|t| {
+                json!({"ticker": t, "status": "active", "volume_24h_fp": "100.00",
+                    "price_level_structure": "linear_cent",
+                    "price_ranges": [{"start": "0.0000", "end": "1.0000", "step": "0.0100"}]})
+            })
             .collect();
         let body = json!({"markets": markets, "cursor": ""}).to_string();
         let _ = write!(
