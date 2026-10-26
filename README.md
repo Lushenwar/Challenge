@@ -252,7 +252,10 @@ Things the docs do not say, found by recording prod traffic:
   because the socket fell behind (6 times in 6 hours); error `7` "Unknown subscription
   ID" answers commands that still named a subscription from before a reconnect.
 - `api.elections.kalshi.com` is served through CloudFront and is **4–5 ms faster** (median)
-  than the direct `external-api-ws.kalshi.com`. See [docs/latency.md](docs/latency.md).
+  than the direct `external-api-ws.kalshi.com`. Racing handshakes (`--race`) gave no gain
+  on average; the source port partly picks the network path (some ports ~2 ms slower) but
+  not repeatably, so the collector relies on its faster-replica rule instead. See
+  [docs/latency.md](docs/latency.md).
 
 ## Known limits
 

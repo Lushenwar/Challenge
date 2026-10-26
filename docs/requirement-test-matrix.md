@@ -69,5 +69,5 @@ against it.
 
 | # | Requirement | Tests | Live evidence |
 |---|---|---|---|
-| 18 | Experiments: racing, source port, … | `racing_opens_several_and_keeps_one`, `sets_nodelay_and_pins_the_source_port`, `a_taken_source_port_falls_back_to_any_port` (net.rs) | E1–E3 with `record`, C1–C4 through the collector ([`latency.md`](latency.md), raw results in [`latency/`](latency/)) |
+| 18 | Experiments: racing, source port, … | `racing_opens_several_and_keeps_one`, `sets_nodelay_and_pins_the_source_port`, `a_taken_source_port_falls_back_to_any_port` (net.rs) | E1–E5 with `record` (E4 racing: no gain on average; E5 source ports: path partly port-dependent, rejected with data), C1–C3 through the collector ([`latency.md`](latency.md), raw results in [`latency/`](latency/)) |
 | 19 | Findings in a markdown file | — | [`latency.md`](latency.md) |

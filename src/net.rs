@@ -68,6 +68,15 @@ pub async fn connect(
     Ok(won)
 }
 
+/// The local address of a connected websocket (plain or TLS).
+pub fn local_addr(ws: &Ws) -> Option<SocketAddr> {
+    match ws.get_ref() {
+        tokio_tungstenite::MaybeTlsStream::Plain(t) => t.local_addr().ok(),
+        tokio_tungstenite::MaybeTlsStream::Rustls(t) => t.get_ref().0.local_addr().ok(),
+        _ => None,
+    }
+}
+
 async fn open(
     req: anyhow::Result<Request>,
     addr: SocketAddr,

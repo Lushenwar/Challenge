@@ -1,0 +1,62 @@
+{
+ "ports_pinned_as_asked": true,
+ "per_connection": [
+  {
+   "conn": 0,
+   "port_a": 42000,
+   "port_b": 42000,
+   "lag_p50_a_us": 151,
+   "lag_p50_b_us": 159
+  },
+  {
+   "conn": 1,
+   "port_a": 42001,
+   "port_b": 42001,
+   "lag_p50_a_us": 113,
+   "lag_p50_b_us": 225
+  },
+  {
+   "conn": 2,
+   "port_a": 42002,
+   "port_b": 42002,
+   "lag_p50_a_us": 1540,
+   "lag_p50_b_us": 508
+  },
+  {
+   "conn": 3,
+   "port_a": 42003,
+   "port_b": 42003,
+   "lag_p50_a_us": 1628,
+   "lag_p50_b_us": 273
+  },
+  {
+   "conn": 4,
+   "port_a": 42004,
+   "port_b": 42004,
+   "lag_p50_a_us": 1894,
+   "lag_p50_b_us": 2172
+  },
+  {
+   "conn": 5,
+   "port_a": 42005,
+   "port_b": 42005,
+   "lag_p50_a_us": 225,
+   "lag_p50_b_us": 281
+  },
+  {
+   "conn": 6,
+   "port_a": 42006,
+   "port_b": 42006,
+   "lag_p50_a_us": 184,
+   "lag_p50_b_us": 139
+  },
+  {
+   "conn": 7,
+   "port_a": 42007,
+   "port_b": 42007,
+   "lag_p50_a_us": 149,
+   "lag_p50_b_us": 180
+  }
+ ],
+ "spearman_rho": 0.69
+}

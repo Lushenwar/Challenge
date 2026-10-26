@@ -56,6 +56,14 @@ struct Args {
     /// Latency lab: set TCP_NODELAY on these connections.
     #[arg(long, value_delimiter = ',')]
     nodelay_conns: Vec<usize>,
+    /// Latency lab: these connections race `--race` handshakes and keep the fastest.
+    #[arg(long, value_delimiter = ',')]
+    race_conns: Vec<usize>,
+    #[arg(long, default_value_t = 4)]
+    race: usize,
+    /// Latency lab: pin local source ports (connection i uses BASE + i * race).
+    #[arg(long)]
+    source_port_base: Option<u16>,
     #[arg(long)]
     out: PathBuf,
 }
@@ -112,14 +120,21 @@ async fn main() -> anyhow::Result<()> {
     let (stop_tx, stop_rx) = watch::channel(false);
     let mut tasks = Vec::new();
     for conn in 0..args.conns {
-        let ip = (!args.ips.is_empty()).then(|| args.ips[conn % args.ips.len()]);
-        let nodelay = args.nodelay_conns.contains(&conn);
+        let net = net::NetOpts {
+            nodelay: args.nodelay_conns.contains(&conn),
+            ip: (!args.ips.is_empty()).then(|| args.ips[conn % args.ips.len()]),
+            race: if args.race_conns.contains(&conn) {
+                args.race
+            } else {
+                1
+            },
+            source_port_base: args.source_port_base,
+        };
         let url =
             (!args.ws_urls.is_empty()).then(|| args.ws_urls[conn % args.ws_urls.len()].clone());
         tasks.push(tokio::spawn(run_conn(
             conn,
-            ip,
-            nodelay,
+            net,
             url,
             exchange.clone(),
             tickers.clone(),
@@ -149,8 +164,7 @@ async fn main() -> anyhow::Result<()> {
 #[allow(clippy::too_many_arguments)]
 async fn run_conn(
     conn: usize,
-    ip: Option<IpAddr>,
-    nodelay: bool,
+    net: net::NetOpts,
     url: Option<String>,
     exchange: Arc<dyn Exchange>,
     tickers: Vec<String>,
@@ -165,32 +179,24 @@ async fn run_conn(
     // Lifecycle (venue-wide) on conn 0 only: it is large and the same on every socket.
     let mut session = exchange.session(conn == 0);
     while !*stop.borrow() {
-        let (mut ws, peer) = match net::connect(
-            exchange.ws_request(url.as_deref())?,
-            &net::NetOpts {
-                nodelay,
-                ip,
-                ..Default::default()
-            },
-            conn,
-        )
-        .await
-        {
-            Ok(x) => x,
-            Err(e) => {
-                tracing::warn!(conn, error = %e, ?backoff, "connect failed");
-                tokio::time::sleep(backoff).await;
-                backoff = (backoff * 2).min(Duration::from_secs(30));
-                continue;
-            }
-        };
+        let (mut ws, peer) =
+            match net::connect(exchange.ws_request(url.as_deref())?, &net, conn).await {
+                Ok(x) => x,
+                Err(e) => {
+                    tracing::warn!(conn, error = %e, ?backoff, "connect failed");
+                    tokio::time::sleep(backoff).await;
+                    backoff = (backoff * 2).min(Duration::from_secs(30));
+                    continue;
+                }
+            };
         backoff = Duration::from_secs(1);
         let peer = peer.to_string();
         let _ = lines.send(
-            json!({"conn": conn, "recv_us": now_us(), "ctrl": "connected", "peer": peer, "nodelay": nodelay})
-                .to_string(),
+            json!({"conn": conn, "recv_us": now_us(), "ctrl": "connected", "peer": peer,
+                "local": net::local_addr(&ws), "nodelay": net.nodelay, "race": net.race})
+            .to_string(),
         );
-        tracing::info!(conn, %peer, nodelay, "connected");
+        tracing::info!(conn, %peer, local = ?net::local_addr(&ws), nodelay = net.nodelay, race = net.race, "connected");
         for text in session.on_connect(&tickers) {
             let _ = lines.send(json!({"conn": conn, "sent_us": now_us(), "cmd": text}).to_string());
             ws.send(Message::text(text)).await?;

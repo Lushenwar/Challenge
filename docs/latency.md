@@ -28,6 +28,14 @@ record --markets 15 --conns 5 --minutes 10 \
   --ws-urls wss://api.elections.kalshi.com/trade-api/ws/v2,wss://external-api-ws.kalshi.com/trade-api/ws/v2 --out e2.jsonl
 # E3: 8 connections pinned two per CloudFront edge IP (TLS SNI keeps the hostname)
 record --markets 15 --conns 8 --minutes 10 --ips 65.8.70.91,65.8.70.101,65.8.70.108,65.8.70.109 --out e3.jsonl
+# E4: racing, in one recording: conns 1,3,5,7 race 4 handshakes, 0,2,4,6 do not; all
+#     reconnect once after 5 min, so each connection connects twice
+record --markets 15 --conns 8 --minutes 10 --race-conns 1,3,5,7 --race 4 --reconnect-after 300 --out e4.jsonl
+# E5: source ports: one edge IP, conn i on local port 42000+i; twice, 90 s apart
+#     (so the 4-tuples leave TIME_WAIT and the same ports are reused)
+record --markets 15 --conns 8 --minutes 10 --ips 65.8.70.109 --source-port-base 42000 --out e5a.jsonl
+record --markets 15 --conns 8 --minutes 10 --ips 65.8.70.109 --source-port-base 42000 --out e5b.jsonl
+python3 scripts/ports_compare.py e5a.json e5b.json e5a-peers.txt e5b-peers.txt
 python3 scripts/latency.py e1.jsonl --labels ... > docs/latency/e1-parallel-nodelay.json
 ```
 
@@ -86,11 +94,9 @@ chaos run).
 - An earlier hypothesis that carrying the venue-wide lifecycle feed slows a connection
   (E1's slowest connection carried it) did **not** hold: in E2 the lifecycle connection
   was the second fastest.
-- Not measured: source-port choice (the collector supports it, see below; its run was
-  cut short), connecting right after Kalshi's scheduled maintenance (none happened during
-  this session), and kernel receive timestamps (`SO_TIMESTAMPNS`).
-  The per-connection variance seen here (~1 ms) would have to be separated from those
-  effects with the same matched-update method.
+- Racing handshakes (E4): no gain on average (below).
+- Not tried: connecting right after Kalshi's scheduled maintenance (none happened during
+  this session) and kernel receive timestamps (`SO_TIMESTAMPNS`).
 
 ## Fed back into the collector
 
@@ -137,7 +143,55 @@ What this shows, and what it does not:
 - Within each run, some sockets are first far more often than others (7–22%), but the
   share also depends on how many busy markets each socket carries, so it is not a pure
   speed ranking; the matched-update method of E1–E3 is the fair one.
-- Racing (C3) made no difference detectable here. A fair test of racing (and of source
-  ports) needs both settings in one recording: e.g. `record` with half the connections
-  racing. Not done.
+- Racing (C3) made no difference detectable here; E4 and E5 below test racing and source
+  ports fairly, with both settings in one recording.
+
+## E4: racing handshakes (one recording)
+
+8 connections to the same 15 markets, 285,690 updates matched across all of them
+(Sunday evening, NFL markets busy). Connections 1, 3, 5, 7 race 4 TCP+TLS+websocket
+handshakes over the hostname's addresses and keep the first to finish; 0, 2, 4, 6 connect
+once. Each connected twice (a forced reconnect at 5 min). Raw:
+[`latency/e4-race.json`](latency/e4-race.json), peers and local ports in
+[`latency/e4-race-peers.txt`](latency/e4-race-peers.txt).
+
+| | connections | median lag behind the first copy (µs) | first (%) |
+|---|---|---|---|
+| raced | 1, 3, 5, 7 | 941, 1093, 826, 394 | 9.6, 7.6, 9.9, 20.3 |
+| not raced | 0, 2, 4, 6 | 688, 554, 640, 1003 | 15.1, 15.8, 14.5, 7.4 |
+
+**Racing does not make a connection faster on average** (raced median of medians
+~880 µs vs ~660 µs). The winning handshake is the one whose TCP+TLS setup was quickest,
+which says little about the path the data then takes. What stands out instead is
+connection 7: first in all four time windows, before and after its reconnect (which
+landed on a different edge IP, `.108`). Speed belongs to the individual connection,
+as in E1/E3.
+
+## E5: source ports (two recordings, same ports)
+
+All 8 connections to one edge IP (`65.8.70.109`), connection i on local port 42000 + i,
+recorded twice 90 s apart; the peers files confirm every connection got its pinned port
+both times. Raw: [`latency/e5a-ports.json`](latency/e5a-ports.json),
+[`latency/e5b-ports.json`](latency/e5b-ports.json), comparison
+[`latency/e5-ports-compare.json`](latency/e5-ports-compare.json).
+
+| port | 42000 | 42001 | 42002 | 42003 | 42004 | 42005 | 42006 | 42007 |
+|---|---|---|---|---|---|---|---|---|
+| median lag, run A (µs) | 151 | 113 | 1540 | 1628 | 1894 | 225 | 184 | 149 |
+| median lag, run B (µs) | 159 | 225 | 508 | 273 | 2172 | 281 | 139 | 180 |
+
+- The lags are **bimodal**: most connections sit 0.1–0.3 ms behind the first copy, a few
+  1.5–2 ms. With destination IP and port fixed, the only thing that differs between
+  connections is the source port, which feeds the flow hash that picks a path through
+  load-balanced links.
+- **Partly repeatable.** Port 42004 was the slowest both times (1.9 and 2.2 ms); 42002
+  and 42003 were slow in A but fast in B. Spearman rank correlation of the two orderings:
+  ρ = 0.69 (8 ports; borderline, roughly p ≈ 0.03 one-sided). So the source port does
+  select the path, but not deterministically across reconnects (other hash inputs or
+  path changes intervene).
+- **Decision: rejected for the collector, with data.** Pinning a "known fast" port
+  would not reliably stay fast, and picking ports needs a probing phase of minutes per
+  socket. The collector's existing *faster replica* rule gets the same benefit at no
+  cost: each market has two connections, and the one that keeps winning becomes the
+  active source. `--source-port-base` stays available for experiments.
 - Correctness was unaffected: all three captures verify with 0 unexplained mismatches.
