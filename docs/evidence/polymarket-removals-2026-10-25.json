@@ -1,0 +1,42 @@
+{
+ "run": "Polymarket, ~2,000 most active markets (4,000 books), 2 replicas, background complete keyset listing (collector code as of af99f33)",
+ "command": "engineering-challenge --exchange polymarket > pm.sbe 2> pm.log; verify pm.sbe --repair --events pm.log",
+ "duration_min": 32,
+ "ended_by": "process killed at 32 min by host memory pressure (not by the collector); capture repaired with verify --repair",
+ "complete_listings": [
+  {
+   "finished_after_min": 21,
+   "books": 476534
+  },
+  {
+   "finished_after_min": 30,
+   "books": 476154
+  }
+ ],
+ "removed_after_two_listings": 26,
+ "removed_checked_against_gamma": {
+  "checked": 24,
+  "closed": 24,
+  "accepting_orders": 0,
+  "method": "GET gamma-api /markets?clob_token_ids=<id>&closed=true for every market logged cause=Removed"
+ },
+ "verify_exit_code": 0,
+ "verify": {
+  "events_loaded": 99411,
+  "explained_mismatches": 14736,
+  "gap_intervals": 24,
+  "interval_violations": 0,
+  "max_snapshot_interval_us": 1719399379,
+  "messages": 19887129,
+  "min_snapshots_per_symbol": 2,
+  "ok": true,
+  "periodic_checked": 109148,
+  "snapshots": 224768,
+  "symbols": 4162,
+  "timestamp_regressions": 57,
+  "unexplained_mismatches": 0,
+  "updates": 19662361,
+  "updates_before_snapshot": 0
+ },
+ "note": "gap_intervals 24 = the 24 removed markets: their data stopped at close and each was in a logged gap until the second complete listing removed it (max ~29 min). Removal latency, not lost data."
+}
